@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         招聘平台自动打招呼助手（BOSS / 智联 / 鱼泡）
 // @namespace    job-deliver.local
-// @version      1.10.31
+// @version      1.10.32
 // @description  在 BOSS直聘、智联招聘、鱼泡直聘职位列表自动打招呼：预设话术、区间扫描、已沟通跳过、BOSS 跨页续跑、速率控制与紧凑配置面板。
 // @author       job_deliver
 // @match        https://www.zhipin.com/*
@@ -6095,6 +6095,208 @@
   }
 
   // =========================================================================
+  // v1.10.32：启动结构自检（仅手动按钮触发，纯只读探测）
+  // 逐项检查当前平台锚点是否命中，复用 log() 输出「锚点名 ✓（命中数）/ ✗ /
+  // — 不适用」，末尾汇总「结构自检 N/M 通过」，失败项各配一句「可能坏在哪层」。
+  // 只做 DOM 查询：不点击、不输入、不发送、不滚动、不弹窗；waitFor* 系列
+  // 带轮询语义一律不调用，仅调用纯查询函数与平台常量锚点。
+  // =========================================================================
+  function selfCheckHitCount(selectors, root) {
+    const scope = root || document;
+    const seen = new Set();
+    for (let i = 0; i < selectors.length; i++) {
+      try {
+        // 多个选择器命中同一节点时只计一次，保证「命中数」真实。
+        const nodes = scope.querySelectorAll(selectors[i]);
+        for (let n = 0; n < nodes.length; n++) seen.add(nodes[n]);
+      } catch (err) {
+        // 忽略选择器异常。
+      }
+    }
+    return seen.size;
+  }
+
+  function selfCheckFirstMatch(selectors, root) {
+    const scope = root || document;
+    for (let i = 0; i < selectors.length; i++) {
+      try {
+        const node = scope.querySelector(selectors[i]);
+        if (node) return node;
+      } catch (err) {
+        // 忽略选择器异常。
+      }
+    }
+    return null;
+  }
+
+  // 探测表：when 决定该项在当前页面状态下是否适用——
+  //   list  职位列表页（shouldActivate 且非 BOSS 聊天页）
+  //   chat  BOSS 聊天页（isBossChatPage）
+  //   panel 聊天面板/抽屉已打开（findChatPanel 命中）
+  //   popup 智联结果弹窗 DOM 已挂载（发送后才出现，未出现 ≠ 结构失配）
+  // check(cards, panel) 返回 { ok, text, tip }；返回 null 表示当前状态不适用。
+  const SELF_CHECK_PROBES = {
+    boss: [
+      { name: '职位卡片列表', when: 'list',
+        check: function (cards) {
+          const count = cards.length;
+          return count
+            ? { ok: true, text: count + ' 张' }
+            : { ok: false, tip: '→ 整个流程无法定位职位，多为页面结构改版或非标准列表页' };
+        } },
+      { name: '卡片点击目标', when: 'list',
+        check: function (cards) {
+          if (!cards.length) return null;
+          const hits = selfCheckHitCount(platform.cardClickTargets, cards[0]);
+          return hits
+            ? { ok: true, text: hits + ' 个候选' }
+            : { ok: false, tip: '→ 卡片点击退化为整卡点击，详情切换可能失败' };
+        } },
+      { name: '沟通按钮锚点', when: 'list',
+        check: function (cards) {
+          if (!cards.length) return null;
+          return findActionButton(cards[0])
+            ? { ok: true, text: '已命中' }
+            : { ok: false, tip: '→ 可能详情面板未展示（点一张卡片后再自检）或按钮锚点已改版' };
+        } },
+      { name: '详情面板锚点', when: 'list',
+        check: function () {
+          return findDetailPanelRoot()
+            ? { ok: true, text: '已命中' }
+            : { ok: false, tip: '→ 详情切换与校验会失败' };
+        } },
+      { name: '聊天输入框', when: 'chat',
+        check: function () {
+          const hits = selfCheckHitCount(platform.inputSelectors);
+          return hits
+            ? { ok: true, text: hits + ' 个候选' }
+            : { ok: false, tip: '→ 聊天页无法填写话术' };
+        } }
+    ],
+    zhaopin: [
+      { name: '职位卡片列表', when: 'list',
+        check: function (cards) {
+          return cards.length
+            ? { ok: true, text: cards.length + ' 张' }
+            : { ok: false, tip: '→ 整个流程无法定位职位，多为页面结构改版或非标准列表页' };
+        } },
+      { name: '沟通按钮锚点', when: 'list',
+        check: function (cards) {
+          if (!cards.length) return null;
+          // 智联为 detail 作用域，findActionButton 允许文档级查找。
+          return findActionButton(cards[0])
+            ? { ok: true, text: '已命中' }
+            : { ok: false, tip: '→ 可能详情面板未展示（点一张卡片后再自检）或按钮锚点已改版' };
+        } },
+      { name: '聊天输入框', when: 'panel',
+        check: function (cards, panel) {
+          const hits = selfCheckHitCount(platform.inputSelectors, panel);
+          return hits
+            ? { ok: true, text: hits + ' 个候选' }
+            : { ok: false, tip: '→ 聊天抽屉内无法填写话术' };
+        } },
+      { name: '结果弹窗结构锚点', when: 'popup',
+        check: function () {
+          const boxes = selfCheckHitCount(
+            ['.deliver-greeting-modal__box', '[class*="deliver-greeting-modal__box"]']);
+          if (!boxes) return null;
+          const closes = selfCheckHitCount([
+            '.deliver-greeting-modal__close', '[class*="deliver-greeting-modal__close"]',
+            'button[aria-label="关闭"]'
+          ]);
+          return closes
+            ? { ok: true, text: '结果框 ' + boxes + ' + 关闭按钮 ' + closes }
+            : { ok: false, tip: '→ 弹窗「×」锚点失配 → 自动关闭退化为「留在」文字与 Esc 兜底' };
+        } }
+    ],
+    yupao: [
+      { name: '职位卡片收集（含 extra/leading 补收）', when: 'list',
+        check: function (cards) {
+          const extra = collectYupaoExtraCards(cards).length;
+          const leading = collectYupaoLeadingCards(cards).length;
+          if (!cards.length && !extra && !leading) {
+            return { ok: false, tip: '→ 整个流程无法定位职位，多为页面结构改版或非标准列表页' };
+          }
+          return { ok: true, text: '主收集 ' + cards.length + ' + extra ' + extra + ' + leading ' + leading };
+        } },
+      { name: '可编辑节点', when: 'panel',
+        check: function (cards, panel) {
+          const hits = selfCheckHitCount(platform.inputSelectors, panel);
+          return hits
+            ? { ok: true, text: hits + ' 个候选' }
+            : { ok: false, tip: '→ 聊天抽屉内无法填写话术' };
+        } },
+      { name: '计数器锚点', when: 'panel',
+        check: function (cards, panel) {
+          const input = selfCheckFirstMatch(platform.inputSelectors, panel);
+          if (!input) return { ok: false, tip: '→ 编辑器未找到 → 计数器同步判断失效' };
+          const current = yupaoCounterText(input);
+          return current >= 0
+            ? { ok: true, text: '已渲染，当前值 ' + current }
+            : { ok: false, tip: '→ 计数器锚点失配 → 0/300 同步判断会失效' };
+        } },
+      { name: '发送按钮', when: 'panel',
+        check: function (cards, panel) {
+          const input = selfCheckFirstMatch(platform.inputSelectors, panel);
+          return findSendButton(panel, input, true)
+            ? { ok: true, text: '已命中' }
+            : { ok: false, tip: '→ 话术写入后无法点击发送（配合计数器项排查）' };
+        } }
+    ]
+  };
+
+  function runStructureSelfCheck() {
+    if (!ui) return;
+    const onChat = isBossChatPage();
+    const onList = !onChat && shouldActivate();
+    const panel = findChatPanel();
+    const cards = collectCards();
+    const probes = SELF_CHECK_PROBES[platform.key] || [];
+    const stateNames = {
+      list: '当前非职位列表页',
+      chat: '仅 BOSS 聊天页可探测',
+      panel: '聊天面板未打开——点一次沟通按钮后再自检',
+      popup: '当前页面无结果弹窗——发送后才会出现'
+    };
+    log('开始结构自检：' + platform.name + ' · ' +
+      (onChat ? '聊天页' : (onList ? '职位列表页' : '其他页面')) +
+      '（只读探测，不点击不发送）');
+    let passed = 0;
+    let failed = 0;
+    for (let i = 0; i < probes.length; i++) {
+      const item = probes[i];
+      const applies = item.when === 'list' ? onList :
+        item.when === 'chat' ? onChat :
+        item.when === 'panel' ? !!panel :
+        item.when === 'popup' ? selfCheckHitCount(
+          ['[class*="deliver-greeting-modal"]']) > 0 : false;
+      if (!applies) {
+        log('  ' + item.name + ' — 不适用（' + stateNames[item.when] + '）');
+        continue;
+      }
+      let result = null;
+      try {
+        result = item.check(cards, panel);
+      } catch (err) {
+        result = { ok: false, tip: '→ 探测自身异常：' + (err && err.message ? err.message : String(err)) };
+      }
+      if (!result) {
+        log('  ' + item.name + ' — 不适用（' + stateNames[item.when] + '）');
+        continue;
+      }
+      if (result.ok) {
+        passed++;
+        log('  ' + item.name + ' ✓（' + (result.text || '命中') + '）', 'ok');
+      } else {
+        failed++;
+        log('  ' + item.name + ' ✗' + (result.tip ? ' ' + result.tip : ''), 'warn');
+      }
+    }
+    log('结构自检 ' + passed + '/' + (passed + failed) + ' 通过' +
+      (failed ? '（✗ 项见上方分层提示）' : '，全部锚点正常'), failed ? 'warn' : 'ok');
+  }
+
+  // =========================================================================
   // 面板 UI
   // =========================================================================
   const PANEL_CSS = [
@@ -6272,6 +6474,10 @@
     '          <label class="jd-check"><input id="jdHumanize" type="checkbox" checked> <span>模拟人工操作（悬停 / 微滚动 / 停顿）</span></label>',
     '          <label class="jd-check"><input id="jdAdaptiveRate" type="checkbox" checked> <span>动态降速（连续异常后自动拉长间隔）</span></label>',
     '        </div>',
+    '        <div class="jd-field">',
+    '          <button id="jdSelfCheck" class="jd-btn jd-ghost" type="button">结构自检</button>',
+    '          <div class="jd-hint">只读探测当前页面锚点：不点击、不输入、不发送；结果输出到下方日志</div>',
+    '        </div>',
     '      </div>',
     '    </details>',
     '    <div class="jd-actions">',
@@ -6390,6 +6596,7 @@
       editText: get('jdEditPreset'),
       editSave: get('jdEditSave'),
       editCancel: get('jdEditCancel'),
+      selfCheck: get('jdSelfCheck'),
       randomPreset: get('jdRandomPreset'),
       enableGreeting: get('jdEnableGreeting'),
       loopMode: get('jdLoopMode'),
@@ -6468,6 +6675,12 @@
     if (ui.editMask) {
       ui.editMask.addEventListener('click', function (event) {
         if (event.target === ui.editMask) closePresetEditor();
+      });
+    }
+    // v1.10.32：启动结构自检按钮（纯只读探测，运行中也可执行）。
+    if (ui.selfCheck) {
+      ui.selfCheck.addEventListener('click', function () {
+        runStructureSelfCheck();
       });
     }
     if (ui.presetSelect) {
