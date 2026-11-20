@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         招聘平台自动打招呼助手（BOSS / 智联 / 鱼泡）
 // @namespace    job-deliver.local
-// @version      1.10.32
+// @version      1.10.33
 // @description  在 BOSS直聘、智联招聘、鱼泡直聘职位列表自动打招呼：预设话术、区间扫描、已沟通跳过、BOSS 跨页续跑、速率控制与紧凑配置面板。
 // @author       job_deliver
 // @match        https://www.zhipin.com/*
@@ -67,7 +67,32 @@
     // adaptiveRate：连续异常时自动拉长间隔，恢复后逐步回到原速。
     rateControl: true,
     humanize: true,
-    adaptiveRate: true
+    adaptiveRate: true,
+    // ===== v1.10.33 新增配置（默认值均为“行为中性”，不影响旧用户既有体验）=====
+    // 试运行：只扫描并展示职位，不点击沟通、不打开聊天、不发送任何消息。
+    dryRun: false,
+    // 发送前预览确认：开启后点「开始」先展示职位清单，用户确认后才真实发送。
+    previewConfirm: false,
+    // 每日最大成功发送数量；0 = 不限制。只统计明确确认成功的消息。
+    dailyLimit: 0,
+    // 每日额度统计时区；空 = 使用本机时区。例：Asia/Shanghai。
+    quotaTimezone: '',
+    // 职位筛选：逗号/换行分隔；全部为空 = 不筛选。
+    includeKeywords: '',
+    excludeKeywords: '',
+    companyBlacklist: '',
+    companyWhitelist: '',
+    locationFilter: '',
+    // 薪资筛选（单位：元/月）；0 = 不限制。
+    minSalary: 0,
+    maxSalary: 0,
+    // 薪资无法解析时的处理：skip 跳过 / review 人工审核 / allow 放行。
+    salaryUnknownPolicy: 'review',
+    // 匹配评分：minScore=0 不启用；低分处理 skip / review。
+    minScore: 0,
+    lowScorePolicy: 'skip',
+    // 同一企业只联系一个职位（默认关闭，保持原有遍历行为）。
+    dedupeByCompany: false
   };
 
   // 投递/简历类按钮一律不作为沟通按钮候选，避免误点。
@@ -786,45 +811,91 @@
   const BOSS_MARK_LIMIT = 800;
   let bossMarkCache = null;
 
-  function readBossMarks() {
+  // v1.10.33：BOSS 职位记录改为状态化结构 { pathname: {status, updatedAt, title} }。
+  // 只有 status='sent'（已确认发送成功）才永久跳过；'failed' 可重新处理；
+  // 'unknown'（已提交但结果无法确认）禁止自动重发，必须人工核实。
+  function readBossRecords() {
     if (bossMarkCache) return bossMarkCache;
     const raw = readStoredJSON(BOSS_MARK_KEY);
-    bossMarkCache = Array.isArray(raw) ? raw.filter(function (item) {
-      return typeof item === 'string' && item;
-    }) : [];
-    return bossMarkCache;
+    const records = {};
+    if (Array.isArray(raw)) {
+      // 旧版字符串数组迁移为 unknown：旧版在点击前就写入标记，无法证明已发送，
+      // 迁移后不自动重发也不自动跳过，交由用户在面板核实。
+      raw.forEach(function (item) {
+        const mark = typeof item === 'string' ? (toPathname(item) || item) : '';
+        if (mark) records[mark] = { status: 'unknown', updatedAt: 0, migrated: true };
+      });
+    } else if (raw && typeof raw === 'object') {
+      Object.keys(raw).forEach(function (key) {
+        const item = raw[key];
+        if (!item || typeof item !== 'object') return;
+        const status = ['pending', 'sent', 'failed', 'unknown'].indexOf(item.status) !== -1
+          ? item.status : 'unknown';
+        records[key] = Object.assign({}, item, { status: status });
+      });
+    }
+    bossMarkCache = records;
+    return records;
   }
 
-  function writeBossMarks(list) {
-    bossMarkCache = list.slice(-BOSS_MARK_LIMIT);
+  function writeBossRecords(records) {
+    const keys = Object.keys(records);
+    if (keys.length > BOSS_MARK_LIMIT) {
+      keys.sort(function (a, b) {
+        return (records[a].updatedAt || 0) - (records[b].updatedAt || 0);
+      });
+      const trimmed = {};
+      keys.slice(keys.length - BOSS_MARK_LIMIT).forEach(function (key) {
+        trimmed[key] = records[key];
+      });
+      bossMarkCache = trimmed;
+    } else {
+      bossMarkCache = records;
+    }
     writeStoredValue(BOSS_MARK_KEY, JSON.stringify(bossMarkCache));
   }
 
-  function markBossJob(key) {
-    if (platform.key !== 'boss' || !key) return;
-    // BOSS 职位链接常带 lid/securityId 等易变参数，持久化标记只保留 pathname，
-    // 保证同一职位在不同会话/不同链接参数下仍能命中。
+  function getBossJobStatus(key) {
+    if (platform.key !== 'boss' || !key) return '';
     const mark = toPathname(key) || key;
-    const list = readBossMarks();
-    if (list.indexOf(mark) !== -1) return;
-    list.push(mark);
-    writeBossMarks(list);
+    const record = readBossRecords()[mark];
+    return record && record.status ? record.status : '';
   }
 
-  // v1.10.11：会话校验失败时回滚标记，避免把“未实际发送”的职位永久跳过。
+  function setBossJobStatus(key, status, extra) {
+    if (platform.key !== 'boss' || !key) return;
+    const mark = toPathname(key) || key;
+    const records = readBossRecords();
+    records[mark] = Object.assign({}, records[mark] || {}, extra || {}, {
+      status: status,
+      updatedAt: Date.now()
+    });
+    writeBossRecords(records);
+  }
+
+  // 兼容原调用点：点击沟通按钮前只创建 pending，绝不提前记成已完成。
+  function markBossJob(key, extra) {
+    setBossJobStatus(key, 'pending', extra);
+  }
+
   function unmarkBossJob(key) {
     if (platform.key !== 'boss' || !key) return;
     const mark = toPathname(key) || key;
-    const list = readBossMarks();
-    const index = list.indexOf(mark);
-    if (index === -1) return;
-    list.splice(index, 1);
-    writeBossMarks(list);
+    const records = readBossRecords();
+    if (!records[mark]) return;
+    delete records[mark];
+    writeBossRecords(records);
   }
 
-  // 把本地标记并入已处理集合，复用现有循环的跳过机制，不改动核心遍历逻辑。
-  // 标记是归一化 pathname，这里按当前卡片重新计算 key 后再并入，
-  // 确保 processed 中的 key 与 findNextCardEntry 使用的 key 完全一致。
+  // 只有已确认发送成功的记录参与永久跳过。
+  function readBossMarks() {
+    const records = readBossRecords();
+    return Object.keys(records).filter(function (key) {
+      return records[key] && records[key].status === 'sent';
+    });
+  }
+
+  // 把 sent 标记并入已处理集合，复用现有循环的跳过机制，不改动核心遍历逻辑。
   function mergeBossMarks() {
     if (platform.key !== 'boss') return;
     const marks = readBossMarks();
@@ -834,6 +905,420 @@
       const key = getJobKey(card);
       if (key && marked.has(toPathname(key) || key)) state.processed.add(key);
     });
+  }
+
+  // =========================================================================
+  // v1.10.33：发送状态机 / 历史记录 / 每日额度 / 职位筛选（P0~P2 共用底座）
+  // 只新增数据结构与查询函数，不替换既有流程；调用点由下方各阶段逐步接入。
+  // =========================================================================
+  const SEND_STATUS = {
+    IDLE: 'IDLE',
+    OPENING: 'OPENING',
+    VERIFYING: 'VERIFYING',
+    FILLING: 'FILLING',
+    READY: 'READY',
+    SENDING: 'SENDING',
+    CONFIRMED: 'CONFIRMED',
+    FAILED: 'FAILED',
+    UNKNOWN: 'UNKNOWN',
+    CANCELLED: 'CANCELLED'
+  };
+
+  // 统一错误策略表：每个错误码都声明是否可重试、是否自动恢复、是否需人工确认、
+  // 是否更新职位状态、是否停止整个任务。调用点按 code 查询，不再散落硬编码。
+  const ERROR_POLICY = {
+    LOGIN_REQUIRED: { retryable: false, autoRecover: false, needUser: true, updateJob: '', stopTask: true },
+    RATE_LIMIT: { retryable: false, autoRecover: false, needUser: true, updateJob: 'failed', stopTask: true },
+    PAGE_CHANGED: { retryable: false, autoRecover: false, needUser: true, updateJob: 'failed', stopTask: true },
+    DETAIL_STUCK: { retryable: false, autoRecover: false, needUser: true, updateJob: 'failed', stopTask: true },
+    NO_ACTION: { retryable: true, autoRecover: false, needUser: false, updateJob: 'failed', stopTask: false },
+    NO_CHAT: { retryable: true, autoRecover: false, needUser: false, updateJob: 'failed', stopTask: false },
+    FILL_FAILED: { retryable: true, autoRecover: false, needUser: false, updateJob: 'failed', stopTask: false },
+    SEND_DISABLED: { retryable: false, autoRecover: false, needUser: true, updateJob: 'failed', stopTask: false },
+    SEND_FAILED: { retryable: true, autoRecover: false, needUser: false, updateJob: 'failed', stopTask: false },
+    SEND_UNKNOWN: { retryable: false, autoRecover: false, needUser: true, updateJob: 'unknown', stopTask: false },
+    TARGET_MISMATCH: { retryable: true, autoRecover: false, needUser: false, updateJob: 'failed', stopTask: false },
+    STALE_MODAL: { retryable: true, autoRecover: true, needUser: false, updateJob: '', stopTask: false },
+    STORAGE_ERROR: { retryable: true, autoRecover: true, needUser: true, updateJob: '', stopTask: false },
+    NETWORK_ERROR: { retryable: true, autoRecover: true, needUser: false, updateJob: '', stopTask: false },
+    USER_STOPPED: { retryable: false, autoRecover: false, needUser: true, updateJob: '', stopTask: true },
+    STOPPED: { retryable: false, autoRecover: false, needUser: true, updateJob: '', stopTask: true },
+    DEFAULT: { retryable: true, autoRecover: false, needUser: false, updateJob: 'failed', stopTask: false }
+  };
+
+  function errorPolicy(code) {
+    return ERROR_POLICY[code] || ERROR_POLICY.DEFAULT;
+  }
+
+  // 任务级状态：暂停 / 跳过 / 发送状态 / 本次任务的失败与未知计数。
+  const taskState = {
+    paused: false,
+    skipRequested: false,
+    sendStatus: SEND_STATUS.IDLE,
+    sendInFlight: false,
+    lastSendResult: null,
+    currentJobKey: '',
+    currentJobMeta: null,
+    failed: 0,
+    unknown: 0,
+    companies: new Set(),
+    startedAt: 0
+  };
+
+  function setSendStatus(status, reason) {
+    if (taskState.sendStatus === status) return;
+    taskState.sendStatus = status;
+    if (reason) log('发送状态：' + status + '（' + reason + '）');
+  }
+
+  function pauseTask() {
+    if (!state.running || taskState.paused) return;
+    taskState.paused = true;
+    setStatus('已暂停');
+    log('任务已暂停：当前职位处理完后不再启动新职位；发送中的消息不会被中断', 'warn');
+    syncTaskButtons();
+  }
+
+  function resumeTask() {
+    if (!taskState.paused) return;
+    taskState.paused = false;
+    setStatus('运行中');
+    log('任务已继续：从暂停处恢复处理', 'ok');
+    syncTaskButtons();
+  }
+
+  async function waitWhilePaused() {
+    while (taskState.paused && !state.stopRequested) {
+      await delay(250);
+    }
+  }
+
+  function requestSkipCurrentJob() {
+    if (!state.running) return;
+    taskState.skipRequested = true;
+    log('已请求跳过当前职位：将在下一个安全点生效（不会中断正在发送的消息）', 'warn');
+  }
+
+  function consumeSkipRequest() {
+    if (!taskState.skipRequested) return false;
+    taskState.skipRequested = false;
+    return true;
+  }
+
+  // -------------------------------------------------------------------------
+  // 历史记录（三平台统一结构，容量限制 500 条）
+  // -------------------------------------------------------------------------
+  const HISTORY_KEY = 'jd_auto_greet_history_v1';
+  const HISTORY_LIMIT = 500;
+
+  function readHistory() {
+    const raw = readStoredJSON(HISTORY_KEY);
+    return Array.isArray(raw) ? raw.filter(function (item) {
+      return item && typeof item === 'object';
+    }) : [];
+  }
+
+  function writeHistory(list) {
+    writeStoredValue(HISTORY_KEY, JSON.stringify(list.slice(-HISTORY_LIMIT)));
+  }
+
+  function historyStatusToDaily(status) {
+    if (status === 'sent' || status === 'confirmed') return 'sent';
+    if (status === 'unknown') return 'unknown';
+    if (status === 'failed') return 'failed';
+    return 'skipped';
+  }
+
+  function recordJobResult(options) {
+    const opts = options || {};
+    const meta = opts.meta || {};
+    const status = opts.status || 'failed';
+    const now = Date.now();
+    const record = {
+      recordId: platform.key + '|' + (opts.jobKey || '') + '|' + now,
+      platform: platform.key,
+      jobId: opts.jobKey || '',
+      jobTitle: meta.title || opts.title || '',
+      companyName: meta.company || '',
+      location: meta.location || '',
+      salary: meta.salaryRaw || '',
+      greeting: opts.greeting || '',
+      status: status,
+      createdAt: now,
+      updatedAt: now,
+      errorCode: opts.errorCode || '',
+      errorMessage: opts.errorMessage || '',
+      confirmedAt: status === 'sent' || status === 'confirmed' ? now : 0
+    };
+    const list = readHistory();
+    list.push(record);
+    writeHistory(list);
+    bumpDaily(historyStatusToDaily(status), 1);
+    if (status === 'failed') taskState.failed++;
+    if (status === 'unknown') taskState.unknown++;
+    updateProgress();
+    return record;
+  }
+
+  function exportHistoryCsv() {
+    const list = readHistory();
+    const header = ['recordId', 'platform', 'jobId', 'jobTitle', 'companyName', 'location',
+      'salary', 'status', 'createdAt', 'confirmedAt', 'errorCode', 'errorMessage'];
+    const rows = [header.join(',')];
+    list.forEach(function (item) {
+      rows.push(header.map(function (key) {
+        const value = item[key] == null ? '' : String(item[key]);
+        return '"' + value.replace(/"/g, '""') + '"';
+      }).join(','));
+    });
+    const blob = new Blob(['\ufeff' + rows.join('\r\n')], { type: 'text/csv;charset=utf-8' });
+    try {
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = 'job-history-' + platform.key + '-' + Date.now() + '.csv';
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      log('历史记录已导出为 CSV（' + list.length + ' 条）', 'ok');
+    } catch (err) {
+      log('历史记录导出失败：' + (err && err.message ? err.message : String(err)), 'error');
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // 每日发送额度（只统计明确确认成功的消息；按可配置时区切日）
+  // -------------------------------------------------------------------------
+  const DAILY_KEY = 'jd_auto_greet_daily_v1';
+
+  function dayKeyOf(config) {
+    const now = new Date();
+    const tz = config && config.quotaTimezone ? String(config.quotaTimezone).trim() : '';
+    if (tz) {
+      try {
+        return new Intl.DateTimeFormat('en-CA', {
+          timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit'
+        }).format(now);
+      } catch (err) {
+        // 非法时区回退到本机时区。
+      }
+    }
+    return now.getFullYear() + '-' +
+      String(now.getMonth() + 1).padStart(2, '0') + '-' +
+      String(now.getDate()).padStart(2, '0');
+  }
+
+  function readDaily(config) {
+    const raw = readStoredJSON(DAILY_KEY);
+    const day = dayKeyOf(config);
+    const empty = { day: day, sent: 0, failed: 0, skipped: 0, unknown: 0 };
+    if (!raw || typeof raw !== 'object' || raw.day !== day) return empty;
+    return {
+      day: day,
+      sent: Number(raw.sent) || 0,
+      failed: Number(raw.failed) || 0,
+      skipped: Number(raw.skipped) || 0,
+      unknown: Number(raw.unknown) || 0
+    };
+  }
+
+  function bumpDaily(field, count) {
+    const config = readAndValidateConfig();
+    const stats = readDaily(config);
+    const key = ['sent', 'failed', 'skipped', 'unknown'].indexOf(field) !== -1 ? field : 'skipped';
+    stats[key] = (stats[key] || 0) + (count || 1);
+    writeStoredValue(DAILY_KEY, JSON.stringify(stats));
+    return stats;
+  }
+
+  function dailyRemaining(config) {
+    const limit = Number(config && config.dailyLimit) || 0;
+    if (limit <= 0) return Infinity;
+    const stats = readDaily(config);
+    return Math.max(0, limit - (stats.sent || 0));
+  }
+
+  // -------------------------------------------------------------------------
+  // 职位元信息与筛选（关键词 / 企业 / 地点 / 薪资 / 评分）
+  // -------------------------------------------------------------------------
+  function splitList(value) {
+    return String(value == null ? '' : value)
+      .split(/[\n,，;；]/)
+      .map(function (item) { return norm(item); })
+      .filter(Boolean);
+  }
+
+  function firstTextBySelectors(card, selectors) {
+    for (let i = 0; i < selectors.length; i++) {
+      let node = null;
+      try {
+        node = card.querySelector(selectors[i]);
+      } catch (err) {
+        node = null;
+      }
+      if (node) {
+        const text = norm(node.textContent || node.getAttribute('title') || '');
+        if (text) return text.slice(0, 40);
+      }
+    }
+    return '';
+  }
+
+  function salaryToMonthly(value, unit, period) {
+    let amount = Number(value) || 0;
+    if (unit === 'K' || unit === 'k') amount *= 1000;
+    else if (unit === '万') amount *= 10000;
+    if (period === '天') amount *= 22;
+    else if (period === '时') amount *= 176;
+    else if (period === '年') amount = amount / 12;
+    return Math.round(amount);
+  }
+
+  function parseSalary(raw) {
+    const text = String(raw || '');
+    const range = text.match(/(\d+(?:\.\d+)?)\s*[-~至]\s*(\d+(?:\.\d+)?)\s*(元|K|k|万)?\s*[\/每]?\s*(天|月|时|年)?/);
+    if (range) {
+      return {
+        parsed: true,
+        min: salaryToMonthly(range[1], range[3], range[4]),
+        max: salaryToMonthly(range[2], range[3], range[4]),
+        raw: range[0]
+      };
+    }
+    const single = text.match(/(\d+(?:\.\d+)?)\s*(元|K|k|万)\s*[\/每]?\s*(天|月|时|年)?/);
+    if (single) {
+      const value = salaryToMonthly(single[1], single[2], single[3]);
+      return { parsed: true, min: value, max: value, raw: single[0] };
+    }
+    return { parsed: false, min: 0, max: 0, raw: '' };
+  }
+
+  function getJobMeta(card) {
+    const text = norm(card && card.textContent ? card.textContent : '');
+    const title = getJobTitle(card) || '';
+    const company = firstTextBySelectors(card, [
+      '.company-name', '.company-title', '.job-card__company', '.jobinfo__company',
+      '.company', '[class*="company-name"]'
+    ]);
+    const location = firstTextBySelectors(card, [
+      '.job-area', '.job-card__location', '.jobinfo__address', '.job-card__area',
+      '[class*="job-area"]', '[class*="location"]'
+    ]);
+    const salaryRaw = (function () {
+      const match = String(card && card.textContent ? card.textContent : '').match(
+        /(\d+(?:\.\d+)?\s*[-~至]\s*\d+(?:\.\d+)?\s*(元|K|k|万)?\s*[\/每]?\s*(天|月|时|年)?|\d+(?:\.\d+)?\s*(元|K|k|万)\s*[\/每]?\s*(天|月|时|年)?)/);
+      return match ? match[0] : '';
+    })();
+    return { title: title, text: text, company: company, location: location,
+      salaryRaw: salaryRaw, salary: parseSalary(salaryRaw) };
+  }
+
+  function jobFilterSkip(reason, meta, policy) {
+    return { pass: false, policy: policy || 'skip', score: 0, reasons: [reason], meta: meta };
+  }
+
+  function evaluateJobFilter(card, config) {
+    const cfg = config || {};
+    const meta = getJobMeta(card);
+    let score = 50;
+    const include = splitList(cfg.includeKeywords);
+    if (include.length) {
+      const hit = include.some(function (word) { return meta.text.indexOf(word) !== -1; });
+      if (!hit) return jobFilterSkip('未包含关键词', meta);
+      score += 15;
+    }
+    const exclude = splitList(cfg.excludeKeywords);
+    for (let i = 0; i < exclude.length; i++) {
+      if (meta.text.indexOf(exclude[i]) !== -1) {
+        return jobFilterSkip('命中排除关键词：' + exclude[i], meta);
+      }
+    }
+    const white = splitList(cfg.companyWhitelist);
+    const black = splitList(cfg.companyBlacklist);
+    if (white.length) {
+      const inWhite = white.some(function (word) { return meta.company.indexOf(word) !== -1; });
+      if (!inWhite) return jobFilterSkip('企业不在白名单', meta);
+      score += 10;
+    }
+    for (let i = 0; i < black.length; i++) {
+      if (meta.company.indexOf(black[i]) !== -1) {
+        return jobFilterSkip('企业命中黑名单：' + black[i], meta);
+      }
+    }
+    const locations = splitList(cfg.locationFilter);
+    if (locations.length) {
+      const hit = locations.some(function (word) { return meta.text.indexOf(word) !== -1; });
+      if (!hit) return jobFilterSkip('地点不匹配', meta);
+      score += 10;
+    }
+    const minSalary = Number(cfg.minSalary) || 0;
+    const maxSalary = Number(cfg.maxSalary) || 0;
+    if (minSalary > 0 || maxSalary > 0) {
+      if (!meta.salary.parsed) {
+        const policy = cfg.salaryUnknownPolicy === 'allow' ? 'allow'
+          : (cfg.salaryUnknownPolicy === 'skip' ? 'skip' : 'review');
+        if (policy === 'allow') {
+          score += 0;
+        } else {
+          return jobFilterSkip('薪资无法解析', meta, policy);
+        }
+      } else {
+        if (minSalary > 0 && meta.salary.max < minSalary) return jobFilterSkip('薪资低于下限', meta);
+        if (maxSalary > 0 && meta.salary.min > maxSalary) return jobFilterSkip('薪资高于上限', meta);
+        score += 10;
+      }
+    }
+    const minScore = Number(cfg.minScore) || 0;
+    if (minScore > 0 && score < minScore) {
+      return jobFilterSkip('匹配评分 ' + score + ' 低于 ' + minScore, meta,
+        cfg.lowScorePolicy === 'review' ? 'review' : 'skip');
+    }
+    return { pass: true, policy: 'pass', score: Math.min(100, score), reasons: [], meta: meta };
+  }
+
+  // 清除所有 unknown 记录，供用户在人工核实后重新处理。
+  function clearUnknownBossJobs() {
+    const records = readBossRecords();
+    let count = 0;
+    Object.keys(records).forEach(function (key) {
+      if (records[key] && records[key].status === 'unknown') {
+        delete records[key];
+        count++;
+      }
+    });
+    if (count) writeBossRecords(records);
+    return count;
+  }
+
+  // 历史记录里存在 unknown 的同一职位 → 禁止自动重发（三平台统一）。
+  function hasUnknownRecord(jobKey) {
+    if (!jobKey) return false;
+    const path = toPathname(jobKey) || jobKey;
+    return readHistory().some(function (item) {
+      if (!item || item.status !== 'unknown' || !item.jobId) return false;
+      return item.jobId === jobKey || (toPathname(item.jobId) || item.jobId) === path;
+    });
+  }
+
+  // 人工核实后清理 unknown 历史（不清除其他状态记录）。
+  function clearUnknownHistory() {
+    const list = readHistory();
+    const kept = list.filter(function (item) { return item && item.status !== 'unknown'; });
+    writeHistory(kept);
+    if (list.length !== kept.length) bossMarkCache = null;
+    return list.length - kept.length;
+  }
+
+  // 存储可用性探测（只读，不写入任何业务数据）。
+  function storageReadable() {
+    try {
+      if (typeof GM_getValue === 'function' || (typeof localStorage !== 'undefined' && localStorage)) {
+        readStoredJSON(STORAGE_KEY);
+        return true;
+      }
+    } catch (err) {
+      return false;
+    }
+    return false;
   }
 
   // =========================================================================
@@ -3014,22 +3499,64 @@
   }
 
   async function tryLoadMore() {
-    const cards = collectCards();
-    if (cards.length) {
+    // v1.10.33：以“卡片数量真实增加 / 出现新职位 key”为准，不再固定等 1.4 秒后
+    // 直接判断；并识别“没有更多”结束态，避免慢网时误判还有更多职位。
+    const beforeCards = collectCards();
+    const beforeCount = beforeCards.length;
+    const beforeKeys = new Set();
+    beforeCards.forEach(function (card) {
+      const key = getJobKey(card);
+      if (key) beforeKeys.add(key);
+    });
+    const hasNew = function () {
+      const now = collectCards();
+      if (now.length > beforeCount) return true;
+      for (let i = 0; i < now.length; i++) {
+        const key = getJobKey(now[i]);
+        if (key && !beforeKeys.has(key)) return true;
+      }
+      return false;
+    };
+    const waitForGrow = async function (timeoutMs) {
+      const started = Date.now();
+      while (!state.stopRequested && Date.now() - started < timeoutMs) {
+        if (hasNew()) return true;
+        await delay(250);
+      }
+      return false;
+    };
+
+    if (beforeCards.length) {
       try {
-        cards[cards.length - 1].scrollIntoView({ block: 'end' });
+        beforeCards[beforeCards.length - 1].scrollIntoView({ block: 'end' });
       } catch (err) {}
     }
     try {
       window.scrollTo(0, document.documentElement.scrollHeight);
     } catch (err) {}
-    await delay(1400);
-    const moreButton = findClickableByText(document, ['加载更多', '加载更多职位', '查看更多职位', '查看更多'], { partial: false });
-    if (moreButton && isRendered(moreButton)) {
-      safeClick(moreButton);
-      await delay(1400);
+    let loaded = await waitForGrow(3000);
+
+    if (!loaded) {
+      const moreButton = findClickableByText(document,
+        ['加载更多', '加载更多职位', '查看更多职位', '查看更多'], { partial: false });
+      if (moreButton && isRendered(moreButton)) {
+        safeClick(moreButton);
+        loaded = await waitForGrow(3000);
+      }
     }
-    return !!findNextCard();
+    if (!loaded) {
+      // 明确结束态：优先按页面文字判断，避免把“列表没有新增”误报成加载失败。
+      let pageText = '';
+      try {
+        pageText = norm(document.body ? document.body.textContent : '');
+      } catch (err) {
+        pageText = '';
+      }
+      if (pageText.indexOf('没有更多') !== -1 || pageText.indexOf('已加载全部') !== -1) {
+        return false;
+      }
+    }
+    return loaded;
   }
 
   // =========================================================================
@@ -4016,85 +4543,174 @@
     log('鱼泡发送按钮为灰色不可用，已解除禁用状态后继续发送', 'warn');
   }
 
-  async function clickSend(panel, input, greeting) {
-    let button = findSendButton(panel, input, true);
-    if (button && isDisabled(button)) {
-      button = await waitFor(function () {
-        const candidate = findSendButton(panel, input, true);
-        return candidate && !isDisabled(candidate) ? candidate : null;
-      }, 2500, 150);
+  // =========================================================================
+  // v1.10.33：发送结果正向验证（三平台统一接口）
+  // confirmed 只认「平台明确成功提示/结果弹窗」或「会话新增目标话术气泡」；
+  // 输入框清空但没有任何正向证据 → unknown（禁止自动重发，要求人工核实）；
+  // 输入框仍保留内容且无新气泡 → failed（可安全重试）。
+  // =========================================================================
+  function countGreetingBubbles(panel, input, greeting) {
+    const snippet = norm(greeting).slice(0, 10);
+    if (!snippet) return 0;
+    const scope = panel || document.body;
+    let text = '';
+    try {
+      text = scope && scope.textContent ? scope.textContent : '';
+    } catch (err) {
+      text = '';
     }
-    if (!button) {
-      log('未找到发送按钮，尝试回车发送', 'warn');
-      pressEnter(input);
-      if (platform.reactInvokeFallback) {
-        reactInvokeEnter(input);
+    const editorText = norm(getEditorText(input));
+    const inputCount = input && input.isContentEditable
+      ? countOccurrences(editorText, snippet) : 0;
+    return Math.max(0, countOccurrences(norm(text), snippet) - inputCount);
+  }
+
+  function hasGreetingText(input, greeting) {
+    const snippet = norm(greeting).slice(0, 8);
+    if (!snippet || !input) return false;
+    return norm(getEditorText(input)).indexOf(snippet) !== -1;
+  }
+
+  function verifySendResult(context) {
+    const ctx = context || {};
+    const panel = ctx.panel || null;
+    const input = ctx.input || null;
+    const greeting = ctx.greeting || '';
+    const baseline = Number(ctx.baseline) || 0;
+    if (detectRateLimit()) {
+      return { status: 'failed', code: 'RATE_LIMIT', reason: '平台提示操作频繁或达到上限' };
+    }
+    // 平台明确成功提示（智联结果弹窗等）。其它平台未配置时自然返回 null。
+    if (findSuccessModal()) {
+      return { status: 'confirmed', reason: '平台成功提示/结果弹窗' };
+    }
+    const bubbles = countGreetingBubbles(panel, input, greeting);
+    if (bubbles > baseline) {
+      return { status: 'confirmed', reason: '会话新增消息气泡 +' + (bubbles - baseline) };
+    }
+    const cleared = !input || !input.isConnected || !isVisible(input) ||
+      norm(getEditorText(input)).length === 0;
+    if (cleared) {
+      // 输入框消失/清空只能说明“可能已提交”，不能证明服务器已接收。
+      return { status: 'unknown', code: 'SEND_UNKNOWN',
+        reason: '输入框已清空但没有正向成功证据（未检测到新消息气泡）' };
+    }
+    return { status: 'failed', code: 'SEND_FAILED',
+      reason: '输入框仍保留内容且未出现新消息气泡' };
+  }
+
+  async function waitForSendResult(context, timeoutMs) {
+    const started = Date.now();
+    const total = timeoutMs || 2500;
+    while (Date.now() - started < total) {
+      const result = verifySendResult(context);
+      if (result.status !== 'failed') return result;
+      await delay(180);
+    }
+    return verifySendResult(context);
+  }
+
+  function finishSendAttempt(result) {
+    taskState.lastSendResult = result;
+    if (result.status === 'confirmed') setSendStatus(SEND_STATUS.CONFIRMED, result.reason);
+    else if (result.status === 'unknown') setSendStatus(SEND_STATUS.UNKNOWN, result.reason);
+    else setSendStatus(SEND_STATUS.FAILED, result.reason);
+  }
+
+  async function clickSend(panel, input, greeting, baseline) {
+    // 同一职位同一时刻只允许一个发送任务；已确认/未知一律不再点击。
+    if (taskState.sendInFlight) {
+      log('发送任务已在进行中，忽略重复的发送调用', 'warn');
+      return taskState.lastSendResult;
+    }
+    taskState.sendInFlight = true;
+    setSendStatus(SEND_STATUS.SENDING, '已触发发送');
+    const context = {
+      platformKey: platform.key,
+      panel: panel || null,
+      input: input || null,
+      greeting: greeting || '',
+      baseline: Number(baseline) || 0
+    };
+    try {
+      let button = findSendButton(panel, input, true);
+      if (button && isDisabled(button)) {
+        button = await waitFor(function () {
+          const candidate = findSendButton(panel, input, true);
+          return candidate && !isDisabled(candidate) ? candidate : null;
+        }, 2500, 150);
       }
-      await delay(600);
-      return;
-    }
-    if (isDisabled(button)) throw makeError('SEND_DISABLED', '发送按钮不可用');
-    log('点击发送');
-    // v1.10.5：发送按钮与沟通按钮同链路——原生 .click() 优先（v1.10.3 实锤
-    // dispatchEvent 派发路径会被站点门禁整段丢弃，el.click() 可穿透），
-    // 未生效再降级 safeClick 全序列与 React 直调。
-    nativeClick(button);
-    if (!(await waitSent(panel, input, greeting, 2200))) {
-      safeClick(button);
-    }
-    if (platform.reactInvokeFallback) {
-      // 关键修复：发送成功后按钮通常仍留在 DOM。旧版只判断「按钮还在」就直调
-      // React onClick，可能把已经发出的消息再发一次。这里先轮询确认发送结果，
-      // 确认已发送立即返回；只有仍未发送时才进入直调兜底。
-      if (await waitSent(panel, input, greeting, 1600)) return;
-      const stillThere = findSendButton(panel, input, true);
-      if (stillThere && !isSent(panel, input, greeting)) {
-        log('合成点击发送未生效，尝试 React 直调兜底', 'warn');
-        reactInvokeClick(stillThere, 8);
-        if (greeting) {
-          // 直调后发送+气泡渲染+输入框清空是异步的，留足时间再确认。
-          if (await waitSent(panel, input, greeting, 1800)) return;
-          if (!isSent(panel, input, greeting) && findSendButton(panel, input, true)) {
+      if (!button) {
+        log('未找到发送按钮，尝试回车发送', 'warn');
+        pressEnter(input);
+        if (platform.reactInvokeFallback) reactInvokeEnter(input);
+        const result = await waitForSendResult(context, 2500);
+        finishSendAttempt(result);
+        return result;
+      }
+      if (isDisabled(button)) {
+        // 平台禁用发送按钮时停止并保留职位状态，不强行解除平台禁用。
+        const disabledResult = { status: 'failed', code: 'SEND_DISABLED', reason: '发送按钮被平台禁用' };
+        finishSendAttempt(disabledResult);
+        throw makeError('SEND_DISABLED', '发送按钮不可用，已停止发送并保留职位状态');
+      }
+      log('点击发送');
+      // v1.10.5：原生 .click() 优先，未生效再降级完整点击序列与组件直调；
+      // 每一步之后都先验证结果，只有“明确失败且输入框仍有话术”才允许下一次点击。
+      nativeClick(button);
+      let result = await waitForSendResult(context, 2200);
+      if (result.status === 'failed' && hasGreetingText(input, greeting)) {
+        safeClick(button);
+        result = await waitForSendResult(context, 1800);
+      }
+      if (platform.reactInvokeFallback && result.status === 'failed' &&
+        hasGreetingText(input, greeting)) {
+        const stillThere = findSendButton(panel, input, true);
+        if (stillThere) {
+          log('合成点击发送未生效，尝试组件直调兜底', 'warn');
+          reactInvokeClick(stillThere, 8);
+          result = await waitForSendResult(context, 1800);
+          if (result.status === 'failed' && hasGreetingText(input, greeting)) {
             log('DOM 直调未确认生效，尝试组件树直调兜底', 'warn');
             reactInvokeClickFiber(stillThere, 16);
+            result = await waitForSendResult(context, 1600);
           }
         }
       }
-      await waitSent(panel, input, greeting, 800);
-    } else {
-      await delay(700);
+      finishSendAttempt(result);
+      return result;
+    } finally {
+      taskState.sendInFlight = false;
     }
   }
 
-  async function retrySend(panel, input, greeting) {
-    // 先给上一轮发送的异步渲染留出时间；一旦确认已发送立即返回，
-    // 不再固定等待 1.4~2 秒，也不会对已发出的消息重复点击。
-    if (await waitSent(panel, input, greeting, 1600)) return;
-    log('未确认发送成功，重试一次', 'warn');
+  async function retrySend(panel, input, greeting, baseline) {
+    // 只有“明确失败”才允许重试；confirmed / unknown 一律禁止自动重发。
+    if (!taskState.lastSendResult || taskState.lastSendResult.status !== 'failed') return;
+    if (!hasGreetingText(input, greeting)) return;
+    log('上一次发送明确失败，执行一次安全重试', 'warn');
+    const context = {
+      platformKey: platform.key,
+      panel: panel || null,
+      input: input || null,
+      greeting: greeting || '',
+      baseline: Number(baseline) || 0
+    };
     const button = findSendButton(panel, input);
     if (button && !isDisabled(button)) {
       nativeClick(button);
-      if (!(await waitSent(panel, input, greeting, 1500))) {
+      let result = await waitForSendResult(context, 1800);
+      if (result.status === 'failed' && hasGreetingText(input, greeting)) {
         safeClick(button);
+        result = await waitForSendResult(context, 1600);
       }
-      if (platform.reactInvokeFallback) {
-        if (await waitSent(panel, input, greeting, 1600)) return;
-        const still = findSendButton(panel, input);
-        if (still && !isSent(panel, input, greeting)) {
-          reactInvokeClick(still, 8);
-          if (await waitSent(panel, input, greeting, 1800)) return;
-          if (!isSent(panel, input, greeting) && findSendButton(panel, input)) {
-            reactInvokeClickFiber(still, 16);
-          }
-        }
-      }
-    } else {
-      pressEnter(input);
-      if (platform.reactInvokeFallback) {
-        reactInvokeEnter(input);
-      }
+      finishSendAttempt(result);
+      return;
     }
-    await waitSent(panel, input, greeting, 800);
+    pressEnter(input);
+    if (platform.reactInvokeFallback) reactInvokeEnter(input);
+    const result = await waitForSendResult(context, 1800);
+    finishSendAttempt(result);
   }
 
   async function closeChat() {
@@ -4564,13 +5180,23 @@
       throw makeError('SKIP', '自动打招呼已关闭（仅切换职位）');
     }
 
+    // v1.10.33：用户“跳过当前职位”只在安全点生效，不中断发送中的消息。
+    if (consumeSkipRequest()) {
+      setSendStatus(SEND_STATUS.CANCELLED, '用户跳过当前职位');
+      throw makeError('SKIP', '用户跳过当前职位');
+    }
+    setSendStatus(SEND_STATUS.OPENING, '打开沟通窗口');
     log('点击沟通按钮' + (actionText ? '：' + actionText : ''));
     // v1.10.6：BOSS 在真正点击「立即沟通」前落本地标记，跳转聊天页后
     // 即使流程状态丢失，返回列表页也能凭标记跳过该职位。
+    // v1.10.33：标记改为状态化记录，点击前只写 pending，发送确认后才改 sent。
     // v1.10.7：同时记录当前列表完整地址与滚动位置（此时卡片已滚动到可视区），
     // 聊天页发送完成后据此显式导航返回。
     if (platform.key === 'boss') {
-      markBossJob(getJobKey(card));
+      markBossJob(getJobKey(card), {
+        title: taskState.currentJobMeta ? taskState.currentJobMeta.title : getJobTitle(card),
+        company: taskState.currentJobMeta ? taskState.currentJobMeta.company : ''
+      });
       updateFlow({
         listUrl: location.href,
         scrollY: Math.round(window.scrollY || 0),
@@ -4578,6 +5204,8 @@
         bossInputStrict: config.bossInputStrict !== false,
         // v1.10.29：跨页接力时同样传递会话一致性校验开关。
         bossSessionVerify: config.bossSessionVerify !== false,
+        // v1.10.33：职位元信息随流程跨页传递，供历史记录与失败重试使用。
+        pendingMeta: taskState.currentJobMeta || getJobMeta(card),
         // v1.10.9：跨页后继续沿用同一张卡片点击的间隔目标时间。
         lastCardClickAt: state.lastCardClickAt,
         nextCardClickAt: state.nextCardClickAt
@@ -4624,6 +5252,9 @@
       throw makeError('LOGIN_REQUIRED', '检测到登录弹窗，请先登录后再执行');
     }
     if (result.type === 'success') {
+      setSendStatus(SEND_STATUS.CONFIRMED, '平台自动发送并给出成功提示');
+      recordJobResult({ status: 'sent', jobKey: taskState.currentJobKey,
+        meta: taskState.currentJobMeta, greeting: config.greeting });
       if (platform.key === 'zhaopin') {
         log('智联已自动发送平台自带招呼语（本地面板预设仅在出现输入框时使用）', 'ok');
       } else {
@@ -4655,6 +5286,7 @@
       return;
     }
 
+    setSendStatus(SEND_STATUS.FILLING, '填写话术');
     log('聊天框已打开，正在填写话术');
 
     // v1.10.13：鱼泡走独立输入同步（execCommand + 完整事件 + 组件直调）。
@@ -4683,19 +5315,38 @@
       norm(getEditorText(input)) !== norm(yupaoGreetingText(config.greeting, input))) {
       throw makeError('FILL_FAILED', '鱼泡输入内容与预设不一致（疑似重复填充），已停止发送');
     }
-    await clickSend(panel, input, config.greeting);
+    // v1.10.33：发送前记录气泡基线；只有“明确成功证据”才算发送成功。
+    setSendStatus(SEND_STATUS.READY, '话术已写入，等待发送');
+    const bubbleBaseline = countGreetingBubbles(panel, input, config.greeting);
+    await clickSend(panel, input, config.greeting, bubbleBaseline);
+    let sendResult = taskState.lastSendResult;
+    if (sendResult && sendResult.status === 'failed') {
+      await retrySend(panel, input, config.greeting, bubbleBaseline);
+      sendResult = taskState.lastSendResult;
+    }
+    if (!sendResult) {
+      sendResult = verifySendResult({
+        platformKey: platform.key, panel: panel, input: input,
+        greeting: config.greeting, baseline: bubbleBaseline
+      });
+    }
 
     const rateLimited = detectRateLimit();
     if (rateLimited) {
       throw makeError('RATE_LIMIT', '平台提示操作频繁或已达到沟通上限，任务已停止');
     }
 
-    if (!isSent(panel, input, config.greeting)) {
-      await retrySend(panel, input, config.greeting);
+    if (sendResult.status !== 'confirmed') {
+      if (sendResult.status === 'unknown') {
+        // 结果未知：禁止自动重发，交由用户核实。
+        throw makeError('SEND_UNKNOWN', '消息已提交但无法确认结果（' +
+          sendResult.reason + '）；已停止自动重发，请人工核实');
+      }
+      throw makeError('SEND_FAILED', '未能确认打招呼语发送成功：' + sendResult.reason);
     }
-    if (!isSent(panel, input, config.greeting)) {
-      throw makeError('SEND_FAILED', '未能确认打招呼语发送成功');
-    }
+    setSendStatus(SEND_STATUS.CONFIRMED, sendResult.reason);
+    recordJobResult({ status: 'sent', jobKey: taskState.currentJobKey,
+      meta: taskState.currentJobMeta, greeting: config.greeting });
 
     await closeChat();
     // v1.10.12：手动输入发送后同样清一次智联结果弹窗，保证无弹窗残留。
@@ -4773,6 +5424,14 @@
     let emptyLoads = 0;
 
     while (!state.stopRequested && state.sent < config.maxJobs) {
+      // v1.10.33：暂停只阻止“启动新职位”，不会打断正在发送的消息。
+      await waitWhilePaused();
+      if (state.stopRequested) break;
+      // v1.10.33：每日额度只统计明确确认成功的消息，用尽后自动停止。
+      if (dailyRemaining(config) <= 0) {
+        log('今日发送额度已用完（上限 ' + config.dailyLimit + '），任务停止', 'warn');
+        break;
+      }
       const currentPath = location.origin + location.pathname;
       if (currentPath !== state.startPath) {
         // 只有鱼泡的原地详情路由允许在同站点、仍属于支持页面时重新锚定。
@@ -4835,14 +5494,51 @@
           continue;
         }
       }
+      // v1.10.33：结果未知的职位禁止自动重发，必须人工核实后清理记录。
+      if (hasUnknownRecord(key) ||
+        (platform.key === 'boss' && getBossJobStatus(key) === 'unknown')) {
+        state.processed.add(key);
+        state.skipped++;
+        bumpDaily('skipped', 1);
+        updateProgress();
+        log('跳过：该职位上次发送结果未知，请人工核实后在「历史记录」中清理再处理', 'warn');
+        continue;
+      }
+
+      // v1.10.33：职位筛选。配置全部为空时直接放行，行为与旧版一致。
+      const verdict = evaluateJobFilter(card, config);
+      if (!verdict.pass) {
+        state.processed.add(key);
+        state.skipped++;
+        bumpDaily('skipped', 1);
+        updateProgress();
+        log('筛选跳过' + (verdict.policy === 'review' ? '（待人工审核）' : '') + '：' +
+          truncate(verdict.meta.title || '未命名职位', 20) + '；' + verdict.reasons.join('；'), 'warn');
+        continue;
+      }
+      if (config.dedupeByCompany && verdict.meta.company) {
+        const companyKey = verdict.meta.company;
+        if (taskState.companies.has(companyKey)) {
+          state.processed.add(key);
+          state.skipped++;
+          bumpDaily('skipped', 1);
+          updateProgress();
+          log('筛选跳过：企业「' + truncate(companyKey, 18) + '」已联系过其他职位', 'warn');
+          continue;
+        }
+        taskState.companies.add(companyKey);
+      }
+
       state.processed.add(key);
       if (platform.key === 'boss') {
         const normalizedKey = toPathname(key);
         if (normalizedKey) state.processed.add(normalizedKey);
       }
-      const title = getJobTitle(card);
+      taskState.currentJobKey = key;
+      taskState.currentJobMeta = verdict.meta;
+      const title = verdict.meta.title || getJobTitle(card);
       log('定位职位（第 ' + (entry.index + 1) + '/' + entry.total + ' 条）：' +
-        truncate(title || '未命名职位', 26));
+        truncate(title || '未命名职位', 26) + '，评分 ' + verdict.score);
 
       // 随机模式从预设列表随机选取；关闭随机时固定使用当前选中的预设。
       // v1.10：关闭自动打招呼时不再选取/打印预设，仅保留卡片切换与跳过流程。
@@ -4861,6 +5557,8 @@
         updateFlow({
           pendingKey: key,
           pendingTitle: title,
+          // v1.10.33：职位元信息随流程跨页保存，供聊天页历史记录与失败重试使用。
+          pendingMeta: verdict.meta,
           greeting: picked ? picked.text : '',
           greetingEnabled: greetingEnabled,
           lastPresetIndex: picked ? picked.index : -1
@@ -4879,8 +5577,18 @@
         updateProgress();
         log('已发送打招呼语（' + state.sent + '/' + config.maxJobs + '）', 'ok');
       } catch (err) {
-        if (err && (err.code === 'LOGIN_REQUIRED' || err.code === 'RATE_LIMIT' ||
-          err.code === 'PAGE_CHANGED' || err.code === 'STOPPED' || err.code === 'DETAIL_STUCK')) {
+        const code = err && err.code ? err.code : '';
+        if (code === 'LOGIN_REQUIRED' || code === 'RATE_LIMIT' ||
+          code === 'PAGE_CHANGED' || code === 'STOPPED' || code === 'DETAIL_STUCK') {
+          // v1.10.33：终止类错误先把职位状态落盘，避免遗留 pending 脏记录。
+          if (platform.key === 'boss' && code !== 'LOGIN_REQUIRED' && code !== 'STOPPED') {
+            setBossJobStatus(key, 'failed', { title: title });
+            recordJobResult({
+              status: 'failed', jobKey: key, meta: verdict.meta,
+              greeting: jobConfig.greeting || '', errorCode: code,
+              errorMessage: (err && err.message) || ''
+            });
+          }
           throw err;
         }
         const loginNow = detectLogin();
@@ -4889,14 +5597,28 @@
         if (rateNow) throw makeError('RATE_LIMIT', '平台提示操作频繁或已达到沟通上限，任务已停止');
 
         state.skipped++;
-        const skipped = !!(err && err.code === 'SKIP');
+        const skipped = code === 'SKIP';
         // 已沟通职位属于正常跳过，不应计入连续失败次数。
         if (skipped) {
           state.failureStreak = 0;
           attempts--; // 正常跳过不消耗重试预算，避免已沟通职位密集的列表提前触发上限。
           lastWasSkip = true;
+          bumpDaily('skipped', 1);
         } else {
           state.failureStreak++;
+          // v1.10.33：失败与未知分开记录；unknown 禁止自动重发。
+          const historyStatus = code === 'SEND_UNKNOWN' ? 'unknown' : 'failed';
+          if (platform.key === 'boss') {
+            setBossJobStatus(key, historyStatus, {
+              title: title, lastError: code + ':' + ((err && err.message) || '')
+            });
+          }
+          recordJobResult({
+            status: historyStatus, jobKey: key, meta: verdict.meta,
+            greeting: jobConfig.greeting || '', errorCode: code,
+            errorMessage: (err && err.message) || ''
+          });
+          if (errorPolicy(code).stopTask) throw err;
         }
         updateProgress();
         log((skipped ? '跳过当前职位：' : '处理异常（不计为跳过）：') +
@@ -4984,6 +5706,97 @@
     return count;
   }
 
+  // v1.10.33：试运行与发送前预览。两者都只读职位列表，绝不点击沟通/发送。
+  function buildPreview(config, cards) {
+    let communicated = 0;
+    const rows = [];
+    const limit = Math.min(cards.length, config.maxJobs);
+    for (let i = 0; i < limit; i++) {
+      if (hasCommunicatedMarker(cards[i])) {
+        communicated++;
+        continue;
+      }
+      const verdict = evaluateJobFilter(cards[i], config);
+      rows.push({
+        index: i + 1,
+        pass: verdict.pass,
+        score: verdict.score,
+        title: verdict.meta.title,
+        company: verdict.meta.company,
+        reasons: verdict.reasons
+      });
+    }
+    const passed = rows.filter(function (row) { return row.pass; }).length;
+    return {
+      total: cards.length,
+      limit: limit,
+      communicated: communicated,
+      passed: passed,
+      remaining: passed,
+      rows: rows,
+      greeting: config.greeting
+    };
+  }
+
+  function showPreviewConfirm(preview) {
+    return new Promise(function (resolve) {
+      if (!ui || !ui.previewMask || !ui.previewBody) {
+        resolve(true);
+        return;
+      }
+      const lines = [];
+      lines.push('平台：' + platform.name);
+      lines.push('列表共 ' + preview.total + ' 条，本次预计处理 ' + preview.limit + ' 条');
+      lines.push('已沟通跳过：' + preview.communicated + ' 条；筛选后剩余：' + preview.remaining + ' 条');
+      lines.push('计划话术：' + truncate(preview.greeting || '', 40));
+      preview.rows.slice(0, 10).forEach(function (row) {
+        lines.push((row.pass ? '✓' : '✗') + ' 第 ' + row.index + ' 条 · ' +
+          truncate(row.title || '未命名职位', 16) +
+          (row.company ? ' · ' + truncate(row.company, 12) : '') +
+          (row.pass ? '' : '（' + row.reasons.join('；') + '）'));
+      });
+      ui.previewBody.textContent = lines.join('\n');
+      ui.previewMask.hidden = false;
+      const cleanup = function (ok) {
+        ui.previewMask.hidden = true;
+        if (ui.previewOk) ui.previewOk.removeEventListener('click', onOk);
+        if (ui.previewCancel) ui.previewCancel.removeEventListener('click', onCancel);
+        resolve(ok);
+      };
+      const onOk = function () { cleanup(true); };
+      const onCancel = function () { cleanup(false); };
+      if (ui.previewOk) ui.previewOk.addEventListener('click', onOk);
+      if (ui.previewCancel) ui.previewCancel.addEventListener('click', onCancel);
+    });
+  }
+
+  async function runDryRun(config, cards) {
+    const limit = Math.min(cards.length, config.maxJobs);
+    let passed = 0;
+    let skipped = 0;
+    log('试运行开始：只扫描与筛选，不点击沟通、不打开聊天、不发送任何消息', 'warn');
+    for (let i = 0; i < limit; i++) {
+      const card = cards[i];
+      const meta = getJobMeta(card);
+      const verdict = evaluateJobFilter(card, config);
+      const communicated = hasCommunicatedMarker(card);
+      if (verdict.pass && !communicated) passed++;
+      else skipped++;
+      log('预览 第 ' + (i + 1) + '/' + limit + ' 条 · ' +
+        truncate(meta.title || '未命名职位', 18) +
+        ' | ' + (meta.company || '企业未知') +
+        ' | ' + (meta.location || '地点未知') +
+        ' | ' + (meta.salaryRaw || '薪资未知') +
+        ' | 评分 ' + verdict.score +
+        (communicated ? ' | 已沟通' : '') +
+        (verdict.pass ? ' | 可处理' : ' | 跳过：' + verdict.reasons.join('；')),
+        verdict.pass && !communicated ? 'ok' : 'warn');
+    }
+    setStatus('试运行完成');
+    log('试运行完成：扫描 ' + limit + ' 条，可处理 ' + passed + ' 条，跳过 ' + skipped +
+      ' 条；全程未发送任何消息', 'ok');
+  }
+
   async function startBatch() {
     if (state.running || state.starting || !ui) return;
     if (isBossChatPage()) {
@@ -5014,6 +5827,36 @@
       return;
     }
 
+    // v1.10.33：试运行模式——只扫描与展示，绝不点击沟通/发送。
+    if (config.dryRun) {
+      state.starting = false;
+      await runDryRun(config, cards);
+      return;
+    }
+    // v1.10.33：发送前预览确认（默认关闭，开启后必须用户确认才真实发送）。
+    if (config.previewConfirm) {
+      const preview = buildPreview(config, cards);
+      const confirmed = await showPreviewConfirm(preview);
+      if (!confirmed) {
+        state.starting = false;
+        setStatus('已取消');
+        log('已取消本次任务：预览未确认', 'warn');
+        return;
+      }
+    }
+    // v1.10.33：每日额度检查（只统计明确确认成功的消息）。
+    const remainingQuota = dailyRemaining(config);
+    if (remainingQuota <= 0) {
+      state.starting = false;
+      setStatus('额度已用完');
+      log('今日发送额度已用完（上限 ' + config.dailyLimit + '），今日不再发送', 'warn');
+      return;
+    }
+    if (remainingQuota !== Infinity && config.maxJobs > remainingQuota) {
+      config.maxJobs = remainingQuota;
+      log('每日剩余额度 ' + remainingQuota + ' 条，本次处理数量自动调整为 ' + remainingQuota, 'warn');
+    }
+
     state.running = true;
     state.starting = false;
     state.stopRequested = false;
@@ -5027,6 +5870,18 @@
     state.startPath = location.origin + location.pathname;
     state.startHost = location.hostname;
     state.processed.clear();
+    // v1.10.33：重置任务级状态（暂停/跳过/发送状态/失败与未知计数/企业去重）。
+    taskState.paused = false;
+    taskState.skipRequested = false;
+    taskState.sendStatus = SEND_STATUS.IDLE;
+    taskState.sendInFlight = false;
+    taskState.lastSendResult = null;
+    taskState.currentJobKey = '';
+    taskState.currentJobMeta = null;
+    taskState.failed = 0;
+    taskState.unknown = 0;
+    taskState.companies.clear();
+    taskState.startedAt = Date.now();
     // v1.10.12：新任务不复用上一轮的区间 key 快照，启动时按当前列表重新记录。
     state.scanRangeKeys = null;
     // v1.10.9：新任务不继承上一轮的卡片点击时间。
@@ -5498,34 +6353,61 @@
       log('点击发送');
       // v1.10.8：发送前短暂停顿并悬停按钮，模拟人工确认后点击。
       if (flow.humanize !== false) await performHumanBehavior(flow, btn);
-      // v1.10.15：记录发送前的消息气泡数，用于识别“已发送但输入框未清空”。
-      const bubbleBefore = flow.bossInputStrict !== false
-        ? bossPageGreetingCount(input, flow.greeting || '')
-        : 0;
+      // v1.10.33：记录气泡基线；只有正向成功证据才算发送成功。
+      const bubbleBefore = countGreetingBubbles(document.body, input, flow.greeting || '');
+      setSendStatus(SEND_STATUS.READY, 'BOSS 聊天页话术已写入');
+      setSendStatus(SEND_STATUS.SENDING, 'BOSS 聊天页发送');
       safeClick(btn);
-      await delay(1600);
-
-      let delivered = !input.isConnected || norm(getEditorText(input)).length === 0;
-      if (!delivered && flow.bossInputStrict !== false) {
-        // 输入框仍保留内容：先轮询是否出现新气泡，避免误判失败后回车重发。
-        const newBubble = await waitFor(function () {
-          return bossPageGreetingCount(input, flow.greeting || '') > bubbleBefore ? true : null;
-        }, 1500, 200);
-        if (newBubble) {
-          delivered = true;
-          log('输入框未清空但已出现新的消息气泡，按已发送处理，避免重复发送', 'ok');
-        }
-      }
-      if (!delivered) {
-        log('未确认发送成功，尝试回车重发', 'warn');
+      let sendResult = await waitForSendResult({
+        platformKey: 'boss', panel: document.body, input: input,
+        greeting: flow.greeting || '', baseline: bubbleBefore
+      }, 4000);
+      if (sendResult.status === 'failed' && hasGreetingText(input, flow.greeting || '')) {
+        // 仅“明确失败且输入框仍有话术”才允许一次安全重试。
+        log('首轮发送明确失败，执行一次安全重试', 'warn');
         pressEnter(input);
-        await delay(1200);
-        delivered = !input.isConnected || norm(getEditorText(input)).length === 0;
+        sendResult = await waitForSendResult({
+          platformKey: 'boss', panel: document.body, input: input,
+          greeting: flow.greeting || '', baseline: bubbleBefore
+        }, 2000);
       }
       if (detectRateLimit()) {
         throw makeError('RATE_LIMIT', '平台提示操作频繁或已达到沟通上限，流程已停止');
       }
-      if (!delivered) throw makeError('SEND_FAILED', '未能确认打招呼语发送成功');
+      if (sendResult.status === 'unknown') {
+        // 结果未知：记录 unknown、禁止自动重发，并停在聊天页供人工核实。
+        setBossJobStatus(flow.pendingKey, 'unknown', { title: flow.pendingTitle });
+        recordJobResult({
+          status: 'unknown', jobKey: flow.pendingKey,
+          meta: flow.pendingMeta || { title: flow.pendingTitle },
+          greeting: flow.greeting || '',
+          errorCode: 'SEND_UNKNOWN', errorMessage: sendResult.reason
+        });
+        const cur = readFlow() || flow;
+        cur.active = false;
+        cur.stopReason = '发送结果未知';
+        cur.lastError = 'SEND_UNKNOWN:' + sendResult.reason;
+        cur.pendingKey = null;
+        writeFlow(cur);
+        setStatus('结果未知，请人工核实');
+        log('发送结果无法确认（' + sendResult.reason +
+          '）：已记录 unknown 并禁止自动重发，请人工核实聊天页后再处理', 'error');
+        state.running = false;
+        syncRunningUI(false);
+        return;
+      }
+      if (sendResult.status !== 'confirmed') {
+        throw makeError('SEND_FAILED', '未能确认打招呼语发送成功：' + sendResult.reason);
+      }
+      setSendStatus(SEND_STATUS.CONFIRMED, sendResult.reason);
+      setBossJobStatus(flow.pendingKey, 'sent', {
+        title: flow.pendingTitle, confirmedAt: Date.now()
+      });
+      recordJobResult({
+        status: 'sent', jobKey: flow.pendingKey,
+        meta: flow.pendingMeta || { title: flow.pendingTitle },
+        greeting: flow.greeting || ''
+      });
 
       flowNow = updateFlow({
         sent: (flow.sent || 0) + 1,
@@ -5541,6 +6423,16 @@
     } catch (err) {
       if (err && (err.code === 'LOGIN_REQUIRED' || err.code === 'RATE_LIMIT' || err.code === 'STOPPED')) {
         const cur = readFlow() || flow;
+        // 平台限流属于明确失败：记录 failed，允许之后重新处理。
+        if (err.code === 'RATE_LIMIT' && flow.pendingKey) {
+          setBossJobStatus(flow.pendingKey, 'failed', { title: flow.pendingTitle });
+          recordJobResult({
+            status: 'failed', jobKey: flow.pendingKey,
+            meta: flow.pendingMeta || { title: flow.pendingTitle },
+            greeting: flow.greeting || '',
+            errorCode: 'RATE_LIMIT', errorMessage: err.message || ''
+          });
+        }
         cur.active = false;
         cur.stopReason = err.message;
         cur.lastError = (err.code || '') + ':' + (err.message || '');
@@ -5554,9 +6446,25 @@
       }
 
       const cur = readFlow() || flow;
-      // v1.10.11：目标会话不一致导致的跳过并未实际发送，回滚已操作标记，
-      // 让该职位下次仍可被正常处理。
-      if (err && err.code === 'TARGET_MISMATCH') unmarkBossJob(flow.pendingKey);
+      // v1.10.33：按错误策略表更新职位状态：明确失败记 failed（可重试）、
+      // 结果未知记 unknown（禁止自动重发）；不再直接删除记录。
+      const policy = errorPolicy(err && err.code);
+      if (flow.pendingKey && policy.updateJob) {
+        setBossJobStatus(flow.pendingKey, policy.updateJob, {
+          title: flow.pendingTitle,
+          lastError: ((err && err.code) || '') + ':' + ((err && err.message) || '')
+        });
+      }
+      if (flow.pendingKey) {
+        recordJobResult({
+          status: policy.updateJob === 'unknown' ? 'unknown' : 'failed',
+          jobKey: flow.pendingKey,
+          meta: flow.pendingMeta || { title: flow.pendingTitle },
+          greeting: flow.greeting || '',
+          errorCode: (err && err.code) || '',
+          errorMessage: (err && err.message) || ''
+        });
+      }
       flowNow = updateFlow({
         skipped: (cur.skipped || 0) + 1,
         failStreak: (cur.failStreak || 0) + 1,
@@ -5797,6 +6705,29 @@
     // v1.10.29：BOSS 会话一致性校验开关，默认开启；只有显式 false 才关闭。
     config.bossSessionVerify = input.bossSessionVerify === false ? false : true;
 
+    // ===== v1.10.33：任务安全 / 筛选 / 额度（默认值中性，旧配置自动兼容）=====
+    config.dryRun = input.dryRun === true;
+    config.previewConfirm = input.previewConfirm === true;
+    config.dailyLimit = Math.max(0, Math.min(500, parseInt(input.dailyLimit, 10) || 0));
+    config.quotaTimezone = String(input.quotaTimezone == null ? '' : input.quotaTimezone).trim().slice(0, 40);
+    config.includeKeywords = String(input.includeKeywords == null ? '' : input.includeKeywords).slice(0, 500);
+    config.excludeKeywords = String(input.excludeKeywords == null ? '' : input.excludeKeywords).slice(0, 500);
+    config.companyBlacklist = String(input.companyBlacklist == null ? '' : input.companyBlacklist).slice(0, 500);
+    config.companyWhitelist = String(input.companyWhitelist == null ? '' : input.companyWhitelist).slice(0, 500);
+    config.locationFilter = String(input.locationFilter == null ? '' : input.locationFilter).slice(0, 200);
+    config.minSalary = Math.max(0, parseInt(input.minSalary, 10) || 0);
+    config.maxSalary = Math.max(0, parseInt(input.maxSalary, 10) || 0);
+    if (config.maxSalary > 0 && config.minSalary > config.maxSalary) {
+      const swap = config.minSalary;
+      config.minSalary = config.maxSalary;
+      config.maxSalary = swap;
+    }
+    config.salaryUnknownPolicy = ['skip', 'review', 'allow'].indexOf(input.salaryUnknownPolicy) !== -1
+      ? input.salaryUnknownPolicy : 'review';
+    config.minScore = Math.max(0, Math.min(100, parseInt(input.minScore, 10) || 0));
+    config.lowScorePolicy = input.lowScorePolicy === 'review' ? 'review' : 'skip';
+    config.dedupeByCompany = input.dedupeByCompany === true;
+
     // v1.10.8：速率控制开关，默认全部开启；只有显式 false 才关闭。
     config.rateControl = input.rateControl === false ? false : true;
     config.humanize = input.humanize === false ? false : true;
@@ -5845,6 +6776,21 @@
       bossAutoReturn: ui.bossAutoReturn ? ui.bossAutoReturn.checked : true,
       bossInputStrict: ui.bossInputStrict ? ui.bossInputStrict.checked : true,
       bossSessionVerify: ui.bossSessionVerify ? ui.bossSessionVerify.checked : true,
+      dryRun: ui.dryRun ? ui.dryRun.checked : false,
+      previewConfirm: ui.previewConfirm ? ui.previewConfirm.checked : false,
+      dailyLimit: ui.dailyLimit ? parseInt(ui.dailyLimit.value, 10) || 0 : 0,
+      quotaTimezone: ui.quotaTimezone ? ui.quotaTimezone.value : '',
+      includeKeywords: ui.includeKeywords ? ui.includeKeywords.value : '',
+      excludeKeywords: ui.excludeKeywords ? ui.excludeKeywords.value : '',
+      companyBlacklist: ui.companyBlacklist ? ui.companyBlacklist.value : '',
+      companyWhitelist: ui.companyWhitelist ? ui.companyWhitelist.value : '',
+      locationFilter: ui.locationFilter ? ui.locationFilter.value : '',
+      minSalary: ui.minSalary ? parseInt(ui.minSalary.value, 10) || 0 : 0,
+      maxSalary: ui.maxSalary ? parseInt(ui.maxSalary.value, 10) || 0 : 0,
+      salaryUnknownPolicy: ui.salaryUnknownPolicy ? ui.salaryUnknownPolicy.value : 'review',
+      minScore: ui.minScore ? parseInt(ui.minScore.value, 10) || 0 : 0,
+      lowScorePolicy: ui.lowScorePolicy ? ui.lowScorePolicy.value : 'skip',
+      dedupeByCompany: ui.dedupeByCompany ? ui.dedupeByCompany.checked : false,
       zhaopinAutoClose: ui.zhaopinAutoClose ? ui.zhaopinAutoClose.checked : true,
       yupaoInputFix: ui.yupaoInputFix ? ui.yupaoInputFix.checked : true,
       rateControl: ui.rateControl ? ui.rateControl.checked : true,
@@ -5869,6 +6815,21 @@
     if (ui.bossAutoReturn) ui.bossAutoReturn.checked = config.bossAutoReturn !== false;
     if (ui.bossInputStrict) ui.bossInputStrict.checked = config.bossInputStrict !== false;
     if (ui.bossSessionVerify) ui.bossSessionVerify.checked = config.bossSessionVerify !== false;
+    if (ui.dryRun) ui.dryRun.checked = config.dryRun === true;
+    if (ui.previewConfirm) ui.previewConfirm.checked = config.previewConfirm === true;
+    if (ui.dailyLimit) ui.dailyLimit.value = config.dailyLimit;
+    if (ui.quotaTimezone) ui.quotaTimezone.value = config.quotaTimezone || '';
+    if (ui.includeKeywords) ui.includeKeywords.value = config.includeKeywords || '';
+    if (ui.excludeKeywords) ui.excludeKeywords.value = config.excludeKeywords || '';
+    if (ui.companyBlacklist) ui.companyBlacklist.value = config.companyBlacklist || '';
+    if (ui.companyWhitelist) ui.companyWhitelist.value = config.companyWhitelist || '';
+    if (ui.locationFilter) ui.locationFilter.value = config.locationFilter || '';
+    if (ui.minSalary) ui.minSalary.value = config.minSalary;
+    if (ui.maxSalary) ui.maxSalary.value = config.maxSalary;
+    if (ui.salaryUnknownPolicy) ui.salaryUnknownPolicy.value = config.salaryUnknownPolicy || 'review';
+    if (ui.minScore) ui.minScore.value = config.minScore;
+    if (ui.lowScorePolicy) ui.lowScorePolicy.value = config.lowScorePolicy || 'skip';
+    if (ui.dedupeByCompany) ui.dedupeByCompany.checked = config.dedupeByCompany === true;
     if (ui.zhaopinAutoClose) ui.zhaopinAutoClose.checked = config.zhaopinAutoClose !== false;
     if (ui.yupaoInputFix) ui.yupaoInputFix.checked = config.yupaoInputFix !== false;
     if (ui.rateControl) ui.rateControl.checked = config.rateControl !== false;
@@ -6245,13 +7206,56 @@
     ]
   };
 
+  // v1.10.33：三平台通用自检项（职位信息提取 / 成功提示 / 存储 / 状态恢复）。
+  const SELF_CHECK_COMMON = [
+    { name: '职位名称提取', when: 'list',
+      check: function (cards) {
+        if (!cards.length) return null;
+        const title = getJobTitle(cards[0]);
+        return title
+          ? { ok: true, text: truncate(title, 16) }
+          : { ok: false, tip: '→ 标题提取失败 → 日志/历史/筛选评分都会退化' };
+      } },
+    { name: '职位 ID 提取', when: 'list',
+      check: function (cards) {
+        if (!cards.length) return null;
+        const key = getJobKey(cards[0]);
+        return key
+          ? { ok: true, text: truncate(key, 24) }
+          : { ok: false, tip: '→ 职位 key 为空 → 去重与断点续跑会失效' };
+      } },
+    { name: '成功提示锚点', when: 'any',
+      check: function () {
+        const texts = (platform.successTexts || []).length;
+        const selectors = (platform.successSelectors || []).length;
+        return (texts || selectors)
+          ? { ok: true, text: '文本 ' + texts + ' + 选择器 ' + selectors }
+          : { ok: false, tip: '→ 无明确成功提示，发送结果只能依赖新增气泡判断（可能 unknown）' };
+      } },
+    { name: '存储可用性', when: 'any',
+      check: function () {
+        return storageReadable()
+          ? { ok: true, text: '可读写' }
+          : { ok: false, tip: '→ 配置/历史/额度无法保存，任务状态无法恢复' };
+      } },
+    { name: '任务状态恢复能力', when: 'any',
+      check: function () {
+        try {
+          const flow = readFlow();
+          return { ok: true, text: flow && flow.active ? '存在未完成流程' : '可读取' };
+        } catch (err) {
+          return { ok: false, tip: '→ 流程状态不可读 → 刷新/跨页后无法恢复任务' };
+        }
+      } }
+  ];
+
   function runStructureSelfCheck() {
     if (!ui) return;
     const onChat = isBossChatPage();
     const onList = !onChat && shouldActivate();
     const panel = findChatPanel();
     const cards = collectCards();
-    const probes = SELF_CHECK_PROBES[platform.key] || [];
+    const probes = (SELF_CHECK_PROBES[platform.key] || []).concat(SELF_CHECK_COMMON);
     const stateNames = {
       list: '当前非职位列表页',
       chat: '仅 BOSS 聊天页可探测',
@@ -6265,7 +7269,8 @@
     let failed = 0;
     for (let i = 0; i < probes.length; i++) {
       const item = probes[i];
-      const applies = item.when === 'list' ? onList :
+      const applies = item.when === 'any' ? true :
+        item.when === 'list' ? onList :
         item.when === 'chat' ? onChat :
         item.when === 'panel' ? !!panel :
         item.when === 'popup' ? selfCheckHitCount(
@@ -6353,6 +7358,17 @@
     '.jd-modal .jd-textarea{min-height:96px;max-height:220px;}',
     '.jd-modal-actions{display:flex;justify-content:flex-end;gap:8px;}',
     '.jd-modal-actions .jd-btn{flex:none;height:30px;padding:0 14px;}',
+    // v1.10.33：任务按钮、筛选/历史/安全设置与预览弹窗。
+    '.jd-actions-extra{display:flex;gap:6px;margin-bottom:6px;}',
+    '.jd-actions-extra .jd-btn{height:28px;font-size:11px;padding:0 8px;}',
+    '.jd-filter-grid{display:flex;flex-direction:column;gap:6px;}',
+    '.jd-filter-grid .jd-textarea{min-height:48px;max-height:90px;font-size:11px;}',
+    '.jd-num-row{display:flex;align-items:center;gap:6px;color:#64748b;font-size:12px;}',
+    '.jd-num-row .jd-input{width:76px;flex:none;height:28px;padding:2px 6px;}',
+    '.jd-preview-body{white-space:pre-wrap;word-break:break-word;max-height:260px;overflow:auto;',
+    'font-size:11px;line-height:1.6;color:#334155;background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:8px;}',
+    '.jd-history-list{max-height:120px;overflow:auto;font-size:11px;color:#475569;white-space:pre-wrap;}',
+    '.jd-history-list .row{padding:3px 0;border-bottom:1px dashed #e2e8f0;}',
     '.jd-preset-actions{display:flex;align-items:center;gap:10px;margin-bottom:4px;}',
     '.jd-preset-actions .jd-btn{flex:none;height:30px;padding:0 12px;}',
     '.jd-check{display:flex;align-items:center;gap:5px;color:#475569;font-size:12px;cursor:pointer;}',
@@ -6480,16 +7496,91 @@
     '        </div>',
     '      </div>',
     '    </details>',
+    // ===== v1.10.33：安全设置 / 职位筛选 / 历史记录 / 高级设置（默认折叠）=====
+    '    <details class="jd-group" id="jdSafetyGroup">',
+    '      <summary>安全设置（试运行 / 预览确认 / 每日额度）</summary>',
+    '      <div class="jd-group-body">',
+    '        <label class="jd-check"><input id="jdDryRun" type="checkbox"> <span>试运行（只扫描展示，不发送）</span></label>',
+    '        <label class="jd-check"><input id="jdPreviewConfirm" type="checkbox"> <span>发送前预览并人工确认</span></label>',
+    '        <div class="jd-num-row"><span>每日发送上限</span><input id="jdDailyLimit" class="jd-input" type="number" min="0" max="500" step="1" value="0"><span>条（0=不限）</span></div>',
+    '        <div class="jd-num-row"><span>额度时区</span><input id="jdQuotaTimezone" class="jd-input" type="text" placeholder="Asia/Shanghai（空=本机）"></div>',
+    '        <div class="jd-hint">每日额度只统计明确确认成功的消息；失败、跳过、结果未知分别记录</div>',
+    '      </div>',
+    '    </details>',
+    '    <details class="jd-group" id="jdFilterGroup">',
+    '      <summary>职位筛选（关键词 / 企业 / 地点 / 薪资 / 评分）</summary>',
+    '      <div class="jd-group-body">',
+    '        <div class="jd-filter-grid">',
+    '          <textarea id="jdIncludeKeywords" class="jd-textarea" rows="2" placeholder="包含关键词（逗号分隔，留空=不限）"></textarea>',
+    '          <textarea id="jdExcludeKeywords" class="jd-textarea" rows="2" placeholder="排除关键词（逗号分隔）"></textarea>',
+    '          <textarea id="jdCompanyWhitelist" class="jd-textarea" rows="2" placeholder="企业白名单（留空=不限）"></textarea>',
+    '          <textarea id="jdCompanyBlacklist" class="jd-textarea" rows="2" placeholder="企业黑名单"></textarea>',
+    '          <input id="jdLocationFilter" class="jd-input" type="text" placeholder="工作地点包含（逗号分隔）">',
+    '          <div class="jd-num-row"><span>最低薪资</span><input id="jdMinSalary" class="jd-input" type="number" min="0" step="500" value="0"><span>最高</span><input id="jdMaxSalary" class="jd-input" type="number" min="0" step="500" value="0"><span>元/月</span></div>',
+    '          <label class="jd-check"><span>薪资无法解析时</span>',
+    '            <select id="jdSalaryUnknownPolicy" class="jd-input jd-select"><option value="review">人工审核（跳过）</option><option value="skip">直接跳过</option><option value="allow">放行</option></select>',
+    '          </label>',
+    '          <div class="jd-num-row"><span>最低匹配分</span><input id="jdMinScore" class="jd-input" type="number" min="0" max="100" step="5" value="0"><span>低分</span>',
+    '            <select id="jdLowScorePolicy" class="jd-input jd-select"><option value="skip">跳过</option><option value="review">人工审核</option></select>',
+    '          </div>',
+    '          <label class="jd-check"><input id="jdDedupeCompany" type="checkbox"> <span>同一企业只联系一个职位</span></label>',
+    '        </div>',
+    '      </div>',
+    '    </details>',
+    '    <details class="jd-group" id="jdHistoryGroup">',
+    '      <summary>历史记录（查询 / 状态 / 导出）</summary>',
+    '      <div class="jd-group-body">',
+    '        <div class="jd-filter-grid">',
+    '          <select id="jdHistoryStatus" class="jd-input jd-select"><option value="">全部状态</option><option value="sent">已发送</option><option value="failed">失败</option><option value="unknown">结果未知</option><option value="skipped">已跳过</option></select>',
+    '          <input id="jdHistoryKeyword" class="jd-input" type="text" placeholder="按职位 / 企业筛选">',
+    '          <div class="jd-actions-extra">',
+    '            <button id="jdHistoryRefresh" class="jd-btn jd-ghost" type="button">刷新</button>',
+    '            <button id="jdHistoryExport" class="jd-btn jd-ghost" type="button">导出 CSV</button>',
+    '            <button id="jdHistoryClearUnknown" class="jd-btn jd-ghost" type="button">清理未知</button>',
+    '            <button id="jdHistoryClear" class="jd-btn jd-danger" type="button">清空历史</button>',
+    '          </div>',
+    '          <div class="jd-history-list" id="jdHistoryList"></div>',
+    '        </div>',
+    '      </div>',
+    '    </details>',
+    '    <details class="jd-group" id="jdAdvancedGroup">',
+    '      <summary>高级设置（配置备份 / 未知状态）</summary>',
+    '      <div class="jd-group-body">',
+    '        <div class="jd-actions-extra">',
+    '          <button id="jdConfigExport" class="jd-btn jd-ghost" type="button">导出配置</button>',
+    '          <button id="jdConfigImport" class="jd-btn jd-ghost" type="button">导入配置</button>',
+    '          <button id="jdConfigReset" class="jd-btn jd-ghost" type="button">恢复默认</button>',
+    '          <button id="jdClearUnknownBoss" class="jd-btn jd-ghost" type="button">清理 BOSS 未知</button>',
+    '        </div>',
+    '        <input id="jdConfigFile" type="file" accept="application/json,.json" style="display:none">',
+    '      </div>',
+    '    </details>',
     '    <div class="jd-actions">',
     '      <button id="jdSave" class="jd-btn jd-ghost" type="button">保存配置</button>',
     '      <button id="jdStart" class="jd-btn jd-primary" type="button">开始</button>',
     '      <button id="jdStop" class="jd-btn jd-danger" type="button" disabled>停止</button>',
+    '    </div>',
+    '    <div class="jd-actions-extra">',
+    '      <button id="jdPause" class="jd-btn jd-ghost" type="button" disabled>暂停</button>',
+    '      <button id="jdResume" class="jd-btn jd-ghost" type="button" disabled>继续</button>',
+    '      <button id="jdSkipJob" class="jd-btn jd-ghost" type="button" disabled>跳过当前职位</button>',
     '    </div>',
     '    <div class="jd-status">',
     '      <span id="jdStatus">就绪</span>',
     '      <span id="jdProgress">0 / 0</span>',
     '    </div>',
     '    <div class="jd-log" id="jdLog"></div>',
+    // v1.10.33：发送前预览确认弹窗（默认关闭，开启后必须确认才发送）。
+    '    <div class="jd-modal-mask" id="jdPreviewMask" hidden>',
+    '      <div class="jd-modal" role="dialog" aria-modal="true">',
+    '        <div class="jd-modal-title">发送前确认</div>',
+    '        <div class="jd-preview-body" id="jdPreviewBody"></div>',
+    '        <div class="jd-modal-actions">',
+    '          <button id="jdPreviewCancel" class="jd-btn jd-ghost" type="button">取消</button>',
+    '          <button id="jdPreviewOk" class="jd-btn jd-primary" type="button">确认开始</button>',
+    '        </div>',
+    '      </div>',
+    '    </div>',
     // v1.10.31：预设话术编辑弹窗（默认隐藏，点条目「编辑」打开）。
     '    <div class="jd-modal-mask" id="jdEditMask" hidden>',
     '      <div class="jd-modal" role="dialog" aria-modal="true">',
@@ -6526,7 +7617,93 @@
   function updateProgress() {
     if (!ui || !ui.progress) return;
     const target = state.target || 0;
-    ui.progress.textContent = state.sent + ' / ' + target + (state.skipped ? ' · 跳过 ' + state.skipped : '');
+    let text = state.sent + ' / ' + target;
+    if (state.skipped) text += ' · 跳过 ' + state.skipped;
+    // v1.10.33：失败/未知分开显示，不再混入成功数。
+    if (taskState.failed) text += ' · 失败 ' + taskState.failed;
+    if (taskState.unknown) text += ' · 未知 ' + taskState.unknown;
+    const config = loadConfig();
+    if (config.dailyLimit > 0) {
+      const remaining = dailyRemaining(config);
+      text += ' · 今日剩余 ' + (remaining === Infinity ? '不限' : remaining);
+    }
+    ui.progress.textContent = text;
+  }
+
+  // v1.10.33：暂停/继续/跳过按钮的可用态（发送中不允许跳过，避免中断消息）。
+  function syncTaskButtons() {
+    if (!ui) return;
+    if (ui.pause) ui.pause.disabled = !state.running || taskState.paused;
+    if (ui.resume) ui.resume.disabled = !state.running || !taskState.paused;
+    if (ui.skip) ui.skip.disabled = !state.running;
+  }
+
+  // v1.10.33：历史记录列表（最近 20 条，支持状态/关键词过滤）。
+  function renderHistoryList() {
+    if (!ui || !ui.historyList) return;
+    const status = ui.historyStatus ? ui.historyStatus.value : '';
+    const keyword = norm(ui.historyKeyword ? ui.historyKeyword.value : '');
+    const list = readHistory().filter(function (item) {
+      if (status && item.status !== status) return false;
+      if (keyword && (norm(item.jobTitle) + norm(item.companyName)).indexOf(keyword) === -1) return false;
+      return true;
+    });
+    ui.historyList.innerHTML = '';
+    const recent = list.slice(-20).reverse();
+    if (!recent.length) {
+      const empty = document.createElement('div');
+      empty.className = 'row';
+      empty.textContent = '暂无记录';
+      ui.historyList.appendChild(empty);
+      return;
+    }
+    recent.forEach(function (item) {
+      const row = document.createElement('div');
+      row.className = 'row';
+      const time = new Date(item.updatedAt || item.createdAt || Date.now())
+        .toLocaleTimeString('zh-CN', { hour12: false });
+      row.textContent = '[' + time + '] ' + (item.status || '') + ' · ' +
+        truncate(item.jobTitle || '未命名职位', 16) +
+        (item.companyName ? ' · ' + truncate(item.companyName, 10) : '') +
+        (item.errorCode ? ' · ' + item.errorCode : '');
+      ui.historyList.appendChild(row);
+    });
+  }
+
+  // v1.10.33：配置导出/导入/恢复默认（导入必须经过 sanitizeConfig 校验）。
+  function exportConfigJson() {
+    const config = loadConfig();
+    try {
+      const blob = new Blob([JSON.stringify(config, null, 2)], { type: 'application/json' });
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = 'job-auto-greet-config-' + Date.now() + '.json';
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      log('配置已导出（JSON）', 'ok');
+    } catch (err) {
+      log('配置导出失败：' + (err && err.message ? err.message : String(err)), 'error');
+    }
+  }
+
+  function importConfigJson(text) {
+    let parsed = null;
+    try {
+      parsed = JSON.parse(String(text || ''));
+    } catch (err) {
+      log('配置导入失败：JSON 格式无效', 'error');
+      return false;
+    }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      log('配置导入失败：根节点必须是对象', 'error');
+      return false;
+    }
+    const config = sanitizeConfig(parsed);
+    persistConfig(config);
+    writeConfigToUI(config);
+    log('配置已导入并生效（预设 ' + config.presets.length + ' 条）', 'ok');
+    return true;
   }
 
   // v1.10.6：循环 / 区间两个开关互斥，且区间输入框只在区间模式下可编辑。
@@ -6542,12 +7719,14 @@
 
   function syncRunningUI(running) {
     if (!ui) return;
-    [ui.newPreset, ui.addPreset, ui.randomPreset, ui.presetSelect, ui.enableGreeting, ui.bossAutoReturn, ui.bossInputStrict, ui.bossSessionVerify, ui.zhaopinAutoClose, ui.yupaoInputFix, ui.rateControl, ui.humanize, ui.adaptiveRate, ui.maxJobs, ui.minInterval, ui.maxInterval, ui.save].forEach(function (el) {
+    [ui.newPreset, ui.addPreset, ui.randomPreset, ui.presetSelect, ui.enableGreeting, ui.bossAutoReturn, ui.bossInputStrict, ui.bossSessionVerify, ui.zhaopinAutoClose, ui.yupaoInputFix, ui.rateControl, ui.humanize, ui.adaptiveRate, ui.maxJobs, ui.minInterval, ui.maxInterval, ui.save,
+      ui.dryRun, ui.previewConfirm, ui.dailyLimit, ui.quotaTimezone, ui.includeKeywords, ui.excludeKeywords, ui.companyBlacklist, ui.companyWhitelist, ui.locationFilter, ui.minSalary, ui.maxSalary, ui.salaryUnknownPolicy, ui.minScore, ui.lowScorePolicy, ui.dedupeByCompany].forEach(function (el) {
       if (el) el.disabled = running;
     });
     if (ui.start) ui.start.disabled = running;
     if (ui.stop) ui.stop.disabled = !running;
     syncScanModeUI();
+    syncTaskButtons();
     renderPresets();
   }
 
@@ -6597,6 +7776,41 @@
       editSave: get('jdEditSave'),
       editCancel: get('jdEditCancel'),
       selfCheck: get('jdSelfCheck'),
+      // v1.10.33：安全 / 筛选 / 历史 / 高级设置与任务按钮。
+      dryRun: get('jdDryRun'),
+      previewConfirm: get('jdPreviewConfirm'),
+      dailyLimit: get('jdDailyLimit'),
+      quotaTimezone: get('jdQuotaTimezone'),
+      previewMask: get('jdPreviewMask'),
+      previewBody: get('jdPreviewBody'),
+      previewOk: get('jdPreviewOk'),
+      previewCancel: get('jdPreviewCancel'),
+      includeKeywords: get('jdIncludeKeywords'),
+      excludeKeywords: get('jdExcludeKeywords'),
+      companyWhitelist: get('jdCompanyWhitelist'),
+      companyBlacklist: get('jdCompanyBlacklist'),
+      locationFilter: get('jdLocationFilter'),
+      minSalary: get('jdMinSalary'),
+      maxSalary: get('jdMaxSalary'),
+      salaryUnknownPolicy: get('jdSalaryUnknownPolicy'),
+      minScore: get('jdMinScore'),
+      lowScorePolicy: get('jdLowScorePolicy'),
+      dedupeByCompany: get('jdDedupeCompany'),
+      historyStatus: get('jdHistoryStatus'),
+      historyKeyword: get('jdHistoryKeyword'),
+      historyRefresh: get('jdHistoryRefresh'),
+      historyExport: get('jdHistoryExport'),
+      historyClearUnknown: get('jdHistoryClearUnknown'),
+      historyClear: get('jdHistoryClear'),
+      historyList: get('jdHistoryList'),
+      configExport: get('jdConfigExport'),
+      configImport: get('jdConfigImport'),
+      configReset: get('jdConfigReset'),
+      configFile: get('jdConfigFile'),
+      clearUnknownBoss: get('jdClearUnknownBoss'),
+      pause: get('jdPause'),
+      resume: get('jdResume'),
+      skip: get('jdSkipJob'),
       randomPreset: get('jdRandomPreset'),
       enableGreeting: get('jdEnableGreeting'),
       loopMode: get('jdLoopMode'),
@@ -6683,6 +7897,59 @@
         runStructureSelfCheck();
       });
     }
+    // ===== v1.10.33：暂停 / 继续 / 跳过 / 历史 / 配置备份 =====
+    if (ui.pause) ui.pause.addEventListener('click', pauseTask);
+    if (ui.resume) ui.resume.addEventListener('click', resumeTask);
+    if (ui.skip) ui.skip.addEventListener('click', requestSkipCurrentJob);
+    if (ui.historyRefresh) ui.historyRefresh.addEventListener('click', renderHistoryList);
+    if (ui.historyStatus) ui.historyStatus.addEventListener('change', renderHistoryList);
+    if (ui.historyKeyword) ui.historyKeyword.addEventListener('input', renderHistoryList);
+    if (ui.historyExport) ui.historyExport.addEventListener('click', exportHistoryCsv);
+    if (ui.historyClearUnknown) {
+      ui.historyClearUnknown.addEventListener('click', function () {
+        const count = clearUnknownHistory() + clearUnknownBossJobs();
+        log(count ? '已清理 ' + count + ' 条“结果未知”记录，可重新处理'
+          : '没有需要清理的未知记录', 'ok');
+        renderHistoryList();
+      });
+    }
+    if (ui.historyClear) {
+      ui.historyClear.addEventListener('click', function () {
+        writeHistory([]);
+        log('历史记录已清空', 'warn');
+        renderHistoryList();
+      });
+    }
+    if (ui.configExport) ui.configExport.addEventListener('click', exportConfigJson);
+    if (ui.configReset) {
+      ui.configReset.addEventListener('click', function () {
+        const config = sanitizeConfig({});
+        persistConfig(config);
+        writeConfigToUI(config);
+        log('已恢复默认配置（预设恢复为内置 3 条）', 'warn');
+      });
+    }
+    if (ui.configImport && ui.configFile) {
+      ui.configImport.addEventListener('click', function () { ui.configFile.click(); });
+      ui.configFile.addEventListener('change', function () {
+        const file = ui.configFile.files && ui.configFile.files[0];
+        if (!file) return;
+        const reader = new FileReader();
+        reader.onload = function () { importConfigJson(reader.result); };
+        reader.onerror = function () { log('配置导入失败：文件读取异常', 'error'); };
+        reader.readAsText(file);
+        ui.configFile.value = '';
+      });
+    }
+    if (ui.clearUnknownBoss) {
+      ui.clearUnknownBoss.addEventListener('click', function () {
+        const count = clearUnknownBossJobs();
+        log(count ? '已清理 BOSS 未知状态 ' + count + ' 条' : '没有 BOSS 未知状态记录', 'ok');
+        renderHistoryList();
+      });
+    }
+    renderHistoryList();
+    syncTaskButtons();
     if (ui.presetSelect) {
       ui.presetSelect.addEventListener('change', function () {
         selectPreset(parseInt(ui.presetSelect.value, 10));
