@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         招聘平台自动打招呼助手（BOSS / 智联 / 鱼泡）
 // @namespace    job-deliver.local
-// @version      1.10.33
+// @version      1.10.34
 // @description  在 BOSS直聘、智联招聘、鱼泡直聘职位列表自动打招呼：预设话术、区间扫描、已沟通跳过、BOSS 跨页续跑、速率控制与紧凑配置面板。
 // @author       job_deliver
 // @match        https://www.zhipin.com/*
@@ -6841,6 +6841,8 @@
     ui.minInterval.value = config.minInterval;
     ui.maxInterval.value = config.maxInterval;
     syncScanModeUI();
+    // v1.10.34：配置写回后同步刷新首页摘要与隐藏 Tab 的派生显示。
+    if (typeof refreshTaskSummary === 'function') refreshTaskSummary();
   }
 
   function pickGreeting(config) {
@@ -6939,6 +6941,8 @@
       select.value = String(uiSelectedPreset);
       select.disabled = state.running;
     }
+    // v1.10.34：话术变化后同步首页预览与固定/随机提示。
+    refreshTaskSummary();
   }
 
   function selectPreset(index) {
@@ -7307,22 +7311,52 @@
   const PANEL_CSS = [
     ':host{all:initial;}',
     '*{box-sizing:border-box;}',
-    '.jd-wrap{width:340px;max-width:calc(100vw - 24px);background:#fff;color:#0f172a;border-radius:14px;',
-    'box-shadow:0 12px 36px rgba(15,23,42,.22),0 2px 8px rgba(15,23,42,.12);overflow:hidden;',
-    'font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif;font-size:13px;line-height:1.5;}',
-    '.jd-head{display:flex;align-items:center;justify-content:space-between;padding:10px 12px;background:#0f172a;color:#fff;',
-    'cursor:move;user-select:none;touch-action:none;}',
-    '.jd-title{display:flex;align-items:center;gap:7px;font-weight:600;font-size:13px;}',
+    // v1.10.34：四 Tab 控制台布局——标题栏/Tab/内容区/日志条/任务栏固定，内容独立滚动。
+    '.jd-wrap{width:370px;max-width:calc(100vw - 24px);max-height:min(72vh,680px);display:flex;flex-direction:column;',
+    'background:#fff;color:#0f172a;border-radius:14px;box-shadow:0 12px 36px rgba(15,23,42,.22),0 2px 8px rgba(15,23,42,.12);',
+    'overflow:hidden;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif;font-size:13px;line-height:1.5;}',
+    '.jd-head{display:flex;align-items:center;gap:8px;padding:9px 12px;background:#0f172a;color:#fff;',
+    'cursor:move;user-select:none;touch-action:none;flex:none;}',
+    '.jd-title{display:flex;align-items:center;gap:7px;font-weight:600;font-size:13px;min-width:0;}',
     '.jd-dot{width:8px;height:8px;border-radius:50%;background:#22c55e;box-shadow:0 0 0 3px rgba(34,197,94,.18);flex:none;}',
-    '.jd-platform{font-size:11px;font-weight:500;color:#bbf7d0;background:rgba(34,197,94,.14);padding:1px 6px;border-radius:999px;}',
+    '.jd-platform{font-size:11px;font-weight:500;color:#bbf7d0;background:rgba(34,197,94,.14);padding:1px 6px;border-radius:999px;white-space:nowrap;}',
+    '.jd-head-meta{display:none;align-items:center;gap:8px;margin-left:auto;font-size:11px;color:#cbd5e1;min-width:0;overflow:hidden;white-space:nowrap;}',
     '.jd-icon{width:24px;height:24px;border:0;border-radius:6px;background:transparent;color:#cbd5e1;cursor:pointer;',
-    'font-size:16px;line-height:1;padding:0;}',
+    'font-size:16px;line-height:1;padding:0;flex:none;}',
     '.jd-icon:hover{background:rgba(255,255,255,.1);color:#fff;}',
-    '.jd-body{padding:10px;max-height:calc(100vh - 96px);overflow:auto;}',
+    // Tab 导航
+    '.jd-tabs{display:flex;gap:2px;padding:0 8px;background:#fff;border-bottom:1px solid #e2e8f0;flex:none;}',
+    '.jd-tab{flex:1;height:34px;border:0;border-bottom:2px solid transparent;background:transparent;color:#64748b;',
+    'font:inherit;font-size:12px;cursor:pointer;transition:color .15s,background .15s;}',
+    '.jd-tab:hover{color:#0f172a;background:#f8fafc;}',
+    '.jd-tab.active{color:#15803d;border-bottom-color:#16a34a;font-weight:600;}',
+    '.jd-tab:focus-visible{outline:2px solid #86efac;outline-offset:-2px;}',
+    // 内容区
+    '.jd-body{flex:1;min-height:0;overflow:auto;padding:10px;}',
+    '.jd-tabpanel[hidden]{display:none;}',
+    '.jd-section{margin:0 0 10px;padding-bottom:8px;border-bottom:1px solid #f1f5f9;}',
+    '.jd-section:last-child{border-bottom:0;margin-bottom:0;padding-bottom:0;}',
+    '.jd-section-title{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:6px;',
+    'color:#334155;font-weight:600;font-size:12px;}',
     '.jd-field{display:block;margin-bottom:8px;}',
     '.jd-label{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:4px;color:#334155;font-weight:600;font-size:12px;}',
     '.jd-hint{color:#94a3b8;font-weight:400;font-size:11px;}',
-    // v1.10.10：折叠分组，非核心设置默认收起，减少默认占用。
+    '.jd-summary{margin-top:5px;padding:4px 7px;border-radius:6px;background:#f8fafc;color:#64748b;font-size:11px;}',
+    '.jd-linkbtn{border:0;background:transparent;color:#1d4ed8;font:inherit;font-size:11px;cursor:pointer;padding:0;flex:none;}',
+    '.jd-linkbtn:hover{text-decoration:underline;}',
+    // 状态与紧凑统计
+    '.jd-status{display:flex;justify-content:space-between;gap:8px;padding:5px 8px;border-radius:7px;background:#f8fafc;color:#475569;font-size:12px;}',
+    '.jd-status span:last-child{color:#16a34a;font-weight:600;white-space:nowrap;}',
+    '.jd-progress{height:4px;margin:6px 0 8px;border-radius:999px;background:#e2e8f0;overflow:hidden;}',
+    '.jd-progress>i{display:block;height:100%;width:0;background:#16a34a;transition:width .25s;}',
+    '.jd-stat-row{display:flex;gap:6px;margin-bottom:10px;}',
+    '.jd-stat{flex:1;min-width:0;padding:4px 6px;border:1px solid #e2e8f0;border-radius:8px;background:#f8fafc;',
+    'text-align:center;color:#64748b;font-size:11px;line-height:1.35;}',
+    '.jd-stat b{display:block;font-size:14px;color:#0f172a;}',
+    '.jd-stat.ok b{color:#15803d;}',
+    '.jd-stat.warn b{color:#b45309;}',
+    '.jd-stat.bad b{color:#b91c1c;}',
+    // 折叠分组（设置页二级分组复用）
     '.jd-group{margin:0 0 8px;border:1px solid #e2e8f0;border-radius:8px;background:#f8fafc;overflow:hidden;}',
     '.jd-group>summary{list-style:none;cursor:pointer;padding:7px 10px;color:#334155;font-size:12px;font-weight:600;',
     'display:flex;align-items:center;justify-content:space-between;user-select:none;}',
@@ -7333,8 +7367,7 @@
     '.jd-group-body .jd-field{margin-top:8px;margin-bottom:8px;}',
     '.jd-group-body .jd-field:last-child{margin-bottom:0;}',
     '.jd-select{height:30px;padding:2px 6px;cursor:pointer;}',
-    '.jd-inline-hint{margin:-2px 0 8px;}',
-    '.jd-preset-list{display:flex;flex-direction:column;gap:6px;max-height:120px;overflow:auto;margin-bottom:6px;}',
+    '.jd-preset-list{display:flex;flex-direction:column;gap:6px;max-height:150px;overflow:auto;margin-bottom:6px;}',
     '.jd-preset{display:flex;align-items:flex-start;gap:8px;padding:7px 8px;border:1px solid #e2e8f0;border-radius:8px;',
     'background:#f8fafc;cursor:pointer;transition:border-color .15s,background .15s,box-shadow .15s;}',
     '.jd-preset:hover{border-color:#cbd5e1;background:#f1f5f9;}',
@@ -7346,46 +7379,60 @@
     '.jd-preset-del{flex:none;border:0;border-radius:6px;background:#fef2f2;color:#b91c1c;padding:3px 7px;font-size:11px;cursor:pointer;}',
     '.jd-preset-del:hover:not(:disabled){background:#fee2e2;}',
     '.jd-preset-del:disabled{opacity:.55;cursor:not-allowed;}',
-    // v1.10.31：预设话术编辑按钮与编辑弹窗（仅管理预设话术模块）。
     '.jd-preset-edit{flex:none;border:0;border-radius:6px;background:#eff6ff;color:#1d4ed8;padding:3px 7px;font-size:11px;cursor:pointer;}',
     '.jd-preset-edit:hover:not(:disabled){background:#dbeafe;}',
     '.jd-preset-edit:disabled{opacity:.55;cursor:not-allowed;}',
+    '.jd-preset-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap;}',
+    '.jd-preset-actions .jd-btn{flex:none;height:30px;padding:0 12px;}',
+    '.jd-preset-preview{margin-top:4px;padding:5px 7px;border-radius:6px;background:#f8fafc;color:#475569;font-size:11px;',
+    'max-height:54px;overflow:hidden;white-space:pre-wrap;word-break:break-word;}',
+    // 弹窗
     '.jd-modal-mask{position:fixed;inset:0;background:rgba(15,23,42,.45);display:flex;align-items:center;justify-content:center;padding:16px;z-index:2147483001;}',
     '.jd-modal-mask[hidden]{display:none;}',
-    '.jd-modal{width:320px;max-width:100%;background:#fff;border-radius:12px;padding:12px;display:flex;flex-direction:column;gap:8px;',
-    'box-shadow:0 16px 40px rgba(15,23,42,.28);}',
+    '.jd-modal{width:320px;max-width:100%;max-height:calc(100vh - 48px);overflow:auto;background:#fff;border-radius:12px;',
+    'padding:12px;display:flex;flex-direction:column;gap:8px;box-shadow:0 16px 40px rgba(15,23,42,.28);}',
     '.jd-modal-title{font-size:12px;font-weight:600;color:#334155;}',
-    '.jd-modal .jd-textarea{min-height:96px;max-height:220px;}',
+    '.jd-modal .jd-textarea{min-height:76px;max-height:160px;}',
     '.jd-modal-actions{display:flex;justify-content:flex-end;gap:8px;}',
     '.jd-modal-actions .jd-btn{flex:none;height:30px;padding:0 14px;}',
-    // v1.10.33：任务按钮、筛选/历史/安全设置与预览弹窗。
-    '.jd-actions-extra{display:flex;gap:6px;margin-bottom:6px;}',
-    '.jd-actions-extra .jd-btn{height:28px;font-size:11px;padding:0 8px;}',
+    '.jd-actions-extra{display:flex;gap:6px;flex-wrap:wrap;}',
+    '.jd-actions-extra .jd-btn{flex:1;min-width:76px;height:28px;font-size:11px;padding:0 8px;}',
     '.jd-filter-grid{display:flex;flex-direction:column;gap:6px;}',
-    '.jd-filter-grid .jd-textarea{min-height:48px;max-height:90px;font-size:11px;}',
-    '.jd-num-row{display:flex;align-items:center;gap:6px;color:#64748b;font-size:12px;}',
+    '.jd-filter-grid .jd-textarea{min-height:44px;max-height:84px;font-size:11px;}',
+    '.jd-num-row{display:flex;align-items:center;gap:6px;color:#64748b;font-size:12px;flex-wrap:wrap;}',
     '.jd-num-row .jd-input{width:76px;flex:none;height:28px;padding:2px 6px;}',
     '.jd-preview-body{white-space:pre-wrap;word-break:break-word;max-height:260px;overflow:auto;',
     'font-size:11px;line-height:1.6;color:#334155;background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:8px;}',
-    '.jd-history-list{max-height:120px;overflow:auto;font-size:11px;color:#475569;white-space:pre-wrap;}',
-    '.jd-history-list .row{padding:3px 0;border-bottom:1px dashed #e2e8f0;}',
-    '.jd-preset-actions{display:flex;align-items:center;gap:10px;margin-bottom:4px;}',
-    '.jd-preset-actions .jd-btn{flex:none;height:30px;padding:0 12px;}',
-    '.jd-check{display:flex;align-items:center;gap:5px;color:#475569;font-size:12px;cursor:pointer;}',
+    '.jd-history-list{max-height:260px;overflow:auto;display:flex;flex-direction:column;gap:6px;}',
+    '.jd-history-empty{color:#94a3b8;font-size:11px;padding:6px 2px;}',
+    '.jd-history-row{border:1px solid #eef2f7;border-radius:8px;padding:6px 8px;background:#fff;cursor:pointer;}',
+    '.jd-history-row:hover{background:#f8fafc;}',
+    '.jd-history-row .head{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:11px;color:#334155;}',
+    '.jd-history-row .head .title{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}',
+    '.jd-history-row .meta{display:none;margin-top:4px;padding-top:4px;border-top:1px dashed #e2e8f0;',
+    'color:#64748b;font-size:11px;white-space:pre-wrap;word-break:break-word;}',
+    '.jd-history-row.open .meta{display:block;}',
+    '.jd-badge{flex:none;font-size:10px;padding:1px 6px;border-radius:999px;background:#f1f5f9;color:#475569;white-space:nowrap;}',
+    '.jd-badge.sent{background:#dcfce7;color:#15803d;}',
+    '.jd-badge.failed{background:#fee2e2;color:#b91c1c;}',
+    '.jd-badge.unknown{background:#fef3c7;color:#b45309;}',
+    '.jd-badge.skipped{background:#f1f5f9;color:#64748b;}',
+    '.jd-check{display:flex;align-items:center;gap:5px;color:#475569;font-size:12px;cursor:pointer;margin-bottom:4px;}',
     '.jd-check input{accent-color:#16a34a;}',
-    '.jd-scan-row{display:flex;align-items:center;gap:6px;margin-top:6px;color:#64748b;font-size:12px;}',
+    '.jd-scan-row{display:flex;align-items:center;gap:6px;margin-top:6px;color:#64748b;font-size:12px;flex-wrap:wrap;}',
     '.jd-scan-row .jd-input{width:60px;flex:none;height:28px;padding:2px 6px;}',
     '.jd-textarea,.jd-input{width:100%;border:1px solid #cbd5e1;border-radius:8px;background:#f8fafc;color:#0f172a;',
     'font:inherit;outline:none;transition:border-color .15s,box-shadow .15s;}',
-    '.jd-textarea{padding:8px;resize:vertical;min-height:76px;max-height:160px;}',
+    '.jd-textarea{padding:8px;resize:vertical;min-height:72px;max-height:160px;}',
     '.jd-textarea:focus,.jd-input:focus{border-color:#16a34a;background:#fff;box-shadow:0 0 0 3px rgba(22,163,74,.12);}',
     '.jd-textarea:disabled,.jd-input:disabled{opacity:.7;cursor:not-allowed;}',
-    '.jd-row{display:flex;gap:10px;}',
-    '.jd-half{flex:1;min-width:0;}',
+    '.jd-row{display:flex;gap:8px;flex-wrap:wrap;}',
+    '.jd-half{flex:1;min-width:130px;}',
     '.jd-range{display:flex;align-items:center;gap:5px;color:#64748b;}',
     '.jd-input{height:30px;padding:4px 7px;}',
-    '.jd-actions{display:flex;gap:6px;margin-top:2px;}',
-    '.jd-btn{flex:1;height:32px;border:1px solid transparent;border-radius:8px;cursor:pointer;font:inherit;font-weight:600;font-size:12px;}',
+    '.jd-actions{display:flex;align-items:center;gap:8px;margin-top:4px;}',
+    '.jd-actions .jd-btn{flex:none;height:30px;padding:0 14px;}',
+    '.jd-btn{flex:1;height:30px;border:1px solid transparent;border-radius:8px;cursor:pointer;font:inherit;font-weight:600;font-size:12px;}',
     '.jd-btn:disabled{opacity:.55;cursor:not-allowed;}',
     '.jd-ghost{background:#f1f5f9;border-color:#e2e8f0;color:#334155;}',
     '.jd-ghost:hover:not(:disabled){background:#e2e8f0;}',
@@ -7393,19 +7440,35 @@
     '.jd-primary:hover:not(:disabled){background:#15803d;}',
     '.jd-danger{background:#fef2f2;border-color:#fecaca;color:#b91c1c;}',
     '.jd-danger:hover:not(:disabled){background:#fee2e2;}',
-    '.jd-status{display:flex;justify-content:space-between;gap:8px;margin-top:8px;padding:5px 8px;border-radius:7px;',
-    'background:#f8fafc;color:#475569;font-size:12px;}',
-    '.jd-status span:last-child{color:#16a34a;font-weight:600;white-space:nowrap;}',
-    '.jd-log{margin-top:6px;max-height:96px;overflow:auto;border-radius:7px;background:#0f172a;padding:5px 8px;',
+    // 日志条 + 抽屉
+    '.jd-logbar{flex:none;border-top:1px solid #e2e8f0;background:#f8fafc;}',
+    '.jd-logtoggle{width:100%;display:flex;align-items:center;gap:8px;padding:6px 10px;border:0;background:transparent;',
+    'color:#475569;font:inherit;font-size:11px;cursor:pointer;text-align:left;}',
+    '.jd-logtoggle .latest{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}',
+    '.jd-logtoggle .latest.ok{color:#15803d;}',
+    '.jd-logtoggle .latest.warn{color:#b45309;}',
+    '.jd-logtoggle .latest.error{color:#b91c1c;}',
+    '.jd-log{margin:0;max-height:150px;overflow:auto;padding:4px 10px 8px;background:#0f172a;',
     'color:#cbd5e1;font:11px/1.5 Consolas,Monaco,monospace;}',
+    '.jd-log[hidden]{display:none;}',
     '.jd-log:empty{display:none;}',
     '.jd-log .line{white-space:pre-wrap;word-break:break-word;}',
     '.jd-log .ok{color:#86efac;}',
     '.jd-log .warn{color:#fde68a;}',
     '.jd-log .error{color:#fca5a5;}',
-    '.jd-wrap.collapsed{width:210px;}',
-    '.jd-wrap.collapsed .jd-body{display:none;}',
-    '@media (max-width:480px){.jd-wrap{width:calc(100vw - 24px);}}'
+    // 底部固定任务栏
+    '.jd-taskbar{flex:none;display:flex;align-items:center;gap:8px;padding:8px 10px;border-top:1px solid #e2e8f0;background:#fff;}',
+    '.jd-taskbar-info{flex:1;min-width:0;font-size:11px;color:#94a3b8;}',
+    '.jd-taskbar-info b{display:block;font-size:12px;color:#334155;}',
+    '.jd-taskbar-hint{flex:none;font-size:10px;color:#b45309;background:#fffbeb;border:1px solid #fde68a;border-radius:999px;padding:1px 6px;}',
+    '.jd-taskbar-actions{display:flex;gap:5px;flex:none;}',
+    '.jd-taskbar-actions .jd-btn{flex:none;min-width:58px;height:30px;padding:0 10px;}',
+    // 收起态
+    '.jd-wrap.collapsed{width:270px;max-height:none;}',
+    '.jd-wrap.collapsed .jd-head-meta{display:flex;}',
+    '.jd-wrap.collapsed .jd-tabs,.jd-wrap.collapsed .jd-body,.jd-wrap.collapsed .jd-logbar,.jd-wrap.collapsed .jd-taskbar{display:none;}',
+    '@media (max-width:480px){.jd-wrap{width:calc(100vw - 24px);max-height:78vh;}}',
+    '@media (max-width:400px){.jd-stat-row{flex-wrap:wrap;}.jd-stat{flex:1 1 44%;}.jd-taskbar-actions .jd-btn{min-width:50px;padding:0 6px;}}'
   ].join('');
 
   const PANEL_HTML = [
@@ -7416,161 +7479,177 @@
     '      <span>自动沟通助手</span>',
     '      <span class="jd-platform" id="jdPlatform"></span>',
     '    </div>',
+    '    <span class="jd-head-meta" id="jdHeadMeta"><span id="jdHeadStatus">就绪</span><span id="jdHeadProgress">0 / 0</span></span>',
     '    <button class="jd-icon" id="jdCollapse" type="button" title="收起面板">−</button>',
     '  </div>',
-    '  <div class="jd-body" id="jdBody">',
-    '    <div class="jd-field">',
-    '      <div class="jd-label">当前话术 <span class="jd-hint" id="jdPresetCount"></span></div>',
-    '      <select id="jdPresetSelect" class="jd-input jd-select"></select>',
-    '    </div>',
-    '    <details class="jd-group" id="jdPresetGroup">',
-    '      <summary>管理预设话术</summary>',
-    '      <div class="jd-group-body">',
-    '        <div class="jd-preset-list" id="jdPresetList"></div>',
-    '        <textarea id="jdNewPreset" class="jd-textarea" rows="3" spellcheck="false" placeholder="输入新的打招呼语，点击下方“添加预设”"></textarea>',
-    '        <div class="jd-preset-actions">',
-    '          <button id="jdAddPreset" class="jd-btn jd-ghost" type="button">添加预设</button>',
-    '          <label class="jd-check"><input id="jdRandomPreset" type="checkbox"> <span>循环时随机使用</span></label>',
+    '  <nav class="jd-tabs" id="jdTabs" role="tablist" aria-label="面板导航">',
+    '    <button class="jd-tab active" id="jdTabBtnTask" type="button" role="tab" data-tab="task" aria-selected="true" aria-controls="jdTabTask">任务</button>',
+    '    <button class="jd-tab" id="jdTabBtnFilter" type="button" role="tab" data-tab="filter" aria-selected="false" aria-controls="jdTabFilter">筛选</button>',
+    '    <button class="jd-tab" id="jdTabBtnHistory" type="button" role="tab" data-tab="history" aria-selected="false" aria-controls="jdTabHistory">记录</button>',
+    '    <button class="jd-tab" id="jdTabBtnSettings" type="button" role="tab" data-tab="settings" aria-selected="false" aria-controls="jdTabSettings">设置</button>',
+    '  </nav>',
+    '  <main class="jd-body" id="jdBody">',
+    // ===== 任务 Tab：只保留高频操作 =====
+    '    <section class="jd-tabpanel" id="jdTabTask" role="tabpanel" aria-labelledby="jdTabBtnTask">',
+    '      <div class="jd-status"><span id="jdStatus">就绪</span><span id="jdProgress">0 / 0</span></div>',
+    '      <div class="jd-progress"><i id="jdProgressBar"></i></div>',
+    '      <div class="jd-stat-row">',
+    '        <div class="jd-stat ok"><b id="jdStatSent">0</b>成功</div>',
+    '        <div class="jd-stat"><b id="jdStatSkipped">0</b>跳过</div>',
+    '        <div class="jd-stat bad"><b id="jdStatFailed">0</b>失败</div>',
+    '        <div class="jd-stat warn"><b id="jdStatUnknown">0</b>未知</div>',
+    '      </div>',
+    '      <div class="jd-section">',
+    '        <div class="jd-section-title"><span>当前话术 <span class="jd-hint" id="jdPresetCount"></span></span>',
+    '          <button id="jdManagePresets" class="jd-linkbtn" type="button">管理话术</button></div>',
+    '        <select id="jdPresetSelect" class="jd-input jd-select"></select>',
+    '        <div class="jd-preset-preview" id="jdPresetPreview">—</div>',
+    '        <div class="jd-hint" id="jdPresetModeHint"></div>',
+    '      </div>',
+    '      <div class="jd-section">',
+    '        <div class="jd-section-title">任务范围 <span class="jd-hint">循环 / 区间互斥</span></div>',
+    '        <label class="jd-check"><input id="jdLoopMode" type="checkbox" checked> <span>循环模式（按处理数量）</span></label>',
+    '        <label class="jd-check"><input id="jdRangeMode" type="checkbox"> <span>区间模式（指定起止序号）</span></label>',
+    '        <div class="jd-scan-row"><span>第</span><input id="jdRangeStart" class="jd-input" type="number" min="1" max="500" step="1"><span>条 ~ 第</span><input id="jdRangeEnd" class="jd-input" type="number" min="1" max="500" step="1"><span>条</span></div>',
+    '        <div class="jd-scan-row"><span>处理数量</span><input id="jdMaxJobs" class="jd-input" type="number" min="1" max="200" step="1"><span>条</span></div>',
+    '        <div class="jd-summary" id="jdIntervalSummary">间隔 —</div>',
+    '      </div>',
+    '      <div class="jd-section">',
+    '        <div class="jd-section-title">发送行为</div>',
+    '        <label class="jd-check"><input id="jdEnableGreeting" type="checkbox" checked> <span>启用自动打招呼</span></label>',
+    '        <div class="jd-hint">关闭后只切换/跳过职位，不点击沟通、不发送话术</div>',
+    '        <label class="jd-check"><input id="jdDryRun" type="checkbox"> <span>试运行（只扫描展示，不发送）</span></label>',
+    '        <label class="jd-check"><input id="jdPreviewConfirm" type="checkbox"> <span>发送前预览并人工确认</span></label>',
+    '        <div class="jd-hint" id="jdRunModeHint">当前：正式运行</div>',
+    '        <div class="jd-hint" id="jdQuotaSummary">每日额度：不限</div>',
+    '      </div>',
+    '    </section>',
+    // ===== 筛选 Tab =====
+    '    <section class="jd-tabpanel" id="jdTabFilter" role="tabpanel" aria-labelledby="jdTabBtnFilter" hidden>',
+    '      <div class="jd-section">',
+    '        <div class="jd-section-title">职位关键词 <span class="jd-hint">逗号或换行分隔，留空=不限</span></div>',
+    '        <div class="jd-filter-grid">',
+    '          <textarea id="jdIncludeKeywords" class="jd-textarea" rows="2" placeholder="包含关键词"></textarea>',
+    '          <textarea id="jdExcludeKeywords" class="jd-textarea" rows="2" placeholder="排除关键词"></textarea>',
     '        </div>',
     '      </div>',
-    '    </details>',
-    '    <div class="jd-field">',
-    '      <label class="jd-check"><input id="jdEnableGreeting" type="checkbox" checked> <span>启用自动打招呼</span></label>',
-    '      <div class="jd-hint">关闭后只切换/跳过职位，不点击沟通、不发送话术</div>',
-    '    </div>',
-    '    <div class="jd-row">',
-    '      <label class="jd-field jd-half">处理数量',
-    '        <input id="jdMaxJobs" class="jd-input" type="number" min="1" max="200" step="1">',
-    '      </label>',
-    '      <label class="jd-field jd-half">操作间隔（秒）',
-    '        <div class="jd-range">',
-    '          <input id="jdMinInterval" class="jd-input" type="number" min="1" max="120" step="1">',
-    '          <span>~</span>',
-    '          <input id="jdMaxInterval" class="jd-input" type="number" min="1" max="120" step="1">',
+    '      <div class="jd-section">',
+    '        <div class="jd-section-title">企业条件</div>',
+    '        <div class="jd-filter-grid">',
+    '          <textarea id="jdCompanyWhitelist" class="jd-textarea" rows="2" placeholder="企业白名单（留空=不限）"></textarea>',
+    '          <textarea id="jdCompanyBlacklist" class="jd-textarea" rows="2" placeholder="企业黑名单"></textarea>',
+    '          <label class="jd-check"><input id="jdDedupeCompany" type="checkbox"> <span>同一企业只联系一个职位</span></label>',
     '        </div>',
-    '      </label>',
-    '    </div>',
-    '    <div class="jd-hint jd-inline-hint">间隔按「上一张卡片点击结束 → 下一张卡片点击开始」计算；建议 ≥3 秒并先登录</div>',
-    '    <details class="jd-group" id="jdMoreGroup">',
-    '      <summary>更多设置（扫描范围 / 平台适配 / 速率控制）</summary>',
-    '      <div class="jd-group-body">',
-    '        <div class="jd-field">',
-    '          <div class="jd-label">扫描范围 <span class="jd-hint">循环 / 区间互斥</span></div>',
-    '          <label class="jd-check"><input id="jdLoopMode" type="checkbox" checked> <span>循环模式（按处理数量）</span></label>',
-    '          <label class="jd-check"><input id="jdRangeMode" type="checkbox"> <span>区间模式（指定起始 / 结束序号）</span></label>',
-    '          <div class="jd-scan-row">',
-    '            <span>第</span><input id="jdRangeStart" class="jd-input" type="number" min="1" max="500" step="1">',
-    '            <span>条 ~ 第</span><input id="jdRangeEnd" class="jd-input" type="number" min="1" max="500" step="1">',
-    '            <span>条</span>',
-    '          </div>',
+    '      </div>',
+    '      <div class="jd-section">',
+    '        <div class="jd-section-title">地点与薪资 <span class="jd-hint">0 = 不限制</span></div>',
+    '        <div class="jd-filter-grid">',
+    '          <input id="jdLocationFilter" class="jd-input" type="text" placeholder="工作地点包含（逗号分隔）">',
+    '          <div class="jd-num-row"><span>最低</span><input id="jdMinSalary" class="jd-input" type="number" min="0" step="500" value="0"><span>最高</span><input id="jdMaxSalary" class="jd-input" type="number" min="0" step="500" value="0"><span>元/月</span></div>',
+    '          <label class="jd-check"><span>薪资无法解析时</span>',
+    '            <select id="jdSalaryUnknownPolicy" class="jd-input jd-select"><option value="review">人工审核（跳过）</option><option value="skip">直接跳过</option><option value="allow">放行</option></select>',
+    '          </label>',
     '        </div>',
+    '      </div>',
+    '      <div class="jd-section">',
+    '        <div class="jd-section-title">匹配评分 <span class="jd-hint">0 = 不启用门槛</span></div>',
+    '        <div class="jd-num-row"><span>最低匹配分</span><input id="jdMinScore" class="jd-input" type="number" min="0" max="100" step="5" value="0"><span>低分</span>',
+    '          <select id="jdLowScorePolicy" class="jd-input jd-select"><option value="skip">跳过</option><option value="review">人工审核</option></select>',
+    '        </div>',
+    '      </div>',
+    '      <div class="jd-summary" id="jdFilterSummary">筛选：全部放行</div>',
+    '    </section>',
+    // ===== 记录 Tab =====
+    '    <section class="jd-tabpanel" id="jdTabHistory" role="tabpanel" aria-labelledby="jdTabBtnHistory" hidden>',
+    '      <div class="jd-stat-row">',
+    '        <div class="jd-stat ok"><b id="jdHistoryStatSent">0</b>已发送</div>',
+    '        <div class="jd-stat bad"><b id="jdHistoryStatFailed">0</b>失败</div>',
+    '        <div class="jd-stat warn"><b id="jdHistoryStatUnknown">0</b>未知</div>',
+    '        <div class="jd-stat"><b id="jdHistoryStatSkipped">0</b>跳过</div>',
+    '      </div>',
+    '      <div class="jd-filter-grid">',
+    '        <select id="jdHistoryStatus" class="jd-input jd-select"><option value="">全部状态</option><option value="sent">已发送</option><option value="failed">失败</option><option value="unknown">结果未知</option><option value="skipped">已跳过</option></select>',
+    '        <input id="jdHistoryKeyword" class="jd-input" type="text" placeholder="按职位 / 企业筛选">',
+    '        <div class="jd-actions-extra">',
+    '          <button id="jdHistoryRefresh" class="jd-btn jd-ghost" type="button">刷新</button>',
+    '          <button id="jdHistoryExport" class="jd-btn jd-ghost" type="button">导出 CSV</button>',
+    '          <button id="jdHistoryClearUnknown" class="jd-btn jd-ghost" type="button">清理未知</button>',
+    '          <button id="jdHistoryClear" class="jd-btn jd-danger" type="button">清空历史</button>',
+    '        </div>',
+    '        <div class="jd-history-list" id="jdHistoryList"></div>',
+    '      </div>',
+    '    </section>',
+    // ===== 设置 Tab =====
+    '    <section class="jd-tabpanel" id="jdTabSettings" role="tabpanel" aria-labelledby="jdTabBtnSettings" hidden>',
+    '      <div class="jd-section">',
+    '        <div class="jd-section-title">任务参数</div>',
+    '        <div class="jd-row">',
+    '          <label class="jd-field jd-half">最小间隔（秒）<input id="jdMinInterval" class="jd-input" type="number" min="1" max="120" step="1"></label>',
+    '          <label class="jd-field jd-half">最大间隔（秒）<input id="jdMaxInterval" class="jd-input" type="number" min="1" max="120" step="1"></label>',
+    '        </div>',
+    '        <div class="jd-hint">间隔按「上一张卡片点击结束 → 下一张卡片点击开始」计算；建议 ≥3 秒并先登录</div>',
+    '      </div>',
+    '      <div class="jd-section">',
+    '        <div class="jd-section-title">安全设置</div>',
+    '        <div class="jd-num-row"><span>每日发送上限</span><input id="jdDailyLimit" class="jd-input" type="number" min="0" max="500" step="1" value="0"><span>条（0=不限）</span></div>',
+    '        <div class="jd-num-row"><span>额度时区</span><input id="jdQuotaTimezone" class="jd-input" type="text" placeholder="Asia/Shanghai（空=本机）"></div>',
+    '        <div class="jd-hint">试运行 / 发送前预览在「任务」页快捷调整；每日额度只统计确认成功的消息</div>',
+    '      </div>',
+    '      <div class="jd-section" id="jdPlatformSection">',
+    '        <div class="jd-section-title">平台适配 <span class="jd-hint">仅显示当前平台</span></div>',
     '        <div class="jd-field" id="jdBossReturnField">',
     '          <label class="jd-check"><input id="jdBossAutoReturn" type="checkbox" checked> <span>BOSS 聊天页发送后自动返回列表</span></label>',
     '          <div class="jd-hint">按原列表地址返回，保留筛选条件并恢复滚动位置</div>',
     '        </div>',
     '        <div class="jd-field" id="jdBossStrictField">',
     '          <label class="jd-check"><input id="jdBossInputStrict" type="checkbox" checked> <span>BOSS 输入精确校验</span></label>',
-    '          <div class="jd-hint">填入前清除草稿/残留内容，发送前校验与预设完全一致，防止重复追加</div>',
     '        </div>',
     '        <div class="jd-field" id="jdBossVerifyField">',
     '          <label class="jd-check"><input id="jdBossSessionVerify" type="checkbox" checked> <span>BOSS 会话与职位校验</span></label>',
-    '          <div class="jd-hint">填写/发送前校验当前会话与目标职位一致；详情页与列表项存在差异被误跳过时可关闭</div>',
     '        </div>',
     '        <div class="jd-field" id="jdZhaopinField">',
     '          <label class="jd-check"><input id="jdZhaopinAutoClose" type="checkbox" checked> <span>智联弹窗自动关闭（兜底）</span></label>',
-    '          <div class="jd-hint">每轮开始前清理残留的「已向对方发送打招呼」弹窗；发送当次仍会自动关闭</div>',
     '        </div>',
     '        <div class="jd-field" id="jdYupaoField">',
     '          <label class="jd-check"><input id="jdYupaoInputFix" type="checkbox" checked> <span>鱼泡输入同步增强</span></label>',
-    '          <div class="jd-hint">补发 input/change/keyup 并直调组件处理器，解决输入后 0/300、发送按钮置灰</div>',
-    '        </div>',
-    '        <div class="jd-field">',
-    '          <div class="jd-label">速率控制（防风控） <span class="jd-hint">建议全部开启</span></div>',
-    '          <label class="jd-check"><input id="jdRateControl" type="checkbox" checked> <span>平滑速率控制（不规则间隔 + 周期休息）</span></label>',
-    '          <label class="jd-check"><input id="jdHumanize" type="checkbox" checked> <span>模拟人工操作（悬停 / 微滚动 / 停顿）</span></label>',
-    '          <label class="jd-check"><input id="jdAdaptiveRate" type="checkbox" checked> <span>动态降速（连续异常后自动拉长间隔）</span></label>',
-    '        </div>',
-    '        <div class="jd-field">',
-    '          <button id="jdSelfCheck" class="jd-btn jd-ghost" type="button">结构自检</button>',
-    '          <div class="jd-hint">只读探测当前页面锚点：不点击、不输入、不发送；结果输出到下方日志</div>',
     '        </div>',
     '      </div>',
-    '    </details>',
-    // ===== v1.10.33：安全设置 / 职位筛选 / 历史记录 / 高级设置（默认折叠）=====
-    '    <details class="jd-group" id="jdSafetyGroup">',
-    '      <summary>安全设置（试运行 / 预览确认 / 每日额度）</summary>',
-    '      <div class="jd-group-body">',
-    '        <label class="jd-check"><input id="jdDryRun" type="checkbox"> <span>试运行（只扫描展示，不发送）</span></label>',
-    '        <label class="jd-check"><input id="jdPreviewConfirm" type="checkbox"> <span>发送前预览并人工确认</span></label>',
-    '        <div class="jd-num-row"><span>每日发送上限</span><input id="jdDailyLimit" class="jd-input" type="number" min="0" max="500" step="1" value="0"><span>条（0=不限）</span></div>',
-    '        <div class="jd-num-row"><span>额度时区</span><input id="jdQuotaTimezone" class="jd-input" type="text" placeholder="Asia/Shanghai（空=本机）"></div>',
-    '        <div class="jd-hint">每日额度只统计明确确认成功的消息；失败、跳过、结果未知分别记录</div>',
+    '      <div class="jd-section">',
+    '        <div class="jd-section-title">速率控制（防风控） <span class="jd-hint">建议全部开启</span></div>',
+    '        <label class="jd-check"><input id="jdRateControl" type="checkbox" checked> <span>平滑速率控制（不规则间隔 + 周期休息）</span></label>',
+    '        <label class="jd-check"><input id="jdHumanize" type="checkbox" checked> <span>模拟人工操作（悬停 / 微滚动 / 停顿）</span></label>',
+    '        <label class="jd-check"><input id="jdAdaptiveRate" type="checkbox" checked> <span>动态降速（连续异常后自动拉长间隔）</span></label>',
     '      </div>',
-    '    </details>',
-    '    <details class="jd-group" id="jdFilterGroup">',
-    '      <summary>职位筛选（关键词 / 企业 / 地点 / 薪资 / 评分）</summary>',
-    '      <div class="jd-group-body">',
-    '        <div class="jd-filter-grid">',
-    '          <textarea id="jdIncludeKeywords" class="jd-textarea" rows="2" placeholder="包含关键词（逗号分隔，留空=不限）"></textarea>',
-    '          <textarea id="jdExcludeKeywords" class="jd-textarea" rows="2" placeholder="排除关键词（逗号分隔）"></textarea>',
-    '          <textarea id="jdCompanyWhitelist" class="jd-textarea" rows="2" placeholder="企业白名单（留空=不限）"></textarea>',
-    '          <textarea id="jdCompanyBlacklist" class="jd-textarea" rows="2" placeholder="企业黑名单"></textarea>',
-    '          <input id="jdLocationFilter" class="jd-input" type="text" placeholder="工作地点包含（逗号分隔）">',
-    '          <div class="jd-num-row"><span>最低薪资</span><input id="jdMinSalary" class="jd-input" type="number" min="0" step="500" value="0"><span>最高</span><input id="jdMaxSalary" class="jd-input" type="number" min="0" step="500" value="0"><span>元/月</span></div>',
-    '          <label class="jd-check"><span>薪资无法解析时</span>',
-    '            <select id="jdSalaryUnknownPolicy" class="jd-input jd-select"><option value="review">人工审核（跳过）</option><option value="skip">直接跳过</option><option value="allow">放行</option></select>',
-    '          </label>',
-    '          <div class="jd-num-row"><span>最低匹配分</span><input id="jdMinScore" class="jd-input" type="number" min="0" max="100" step="5" value="0"><span>低分</span>',
-    '            <select id="jdLowScorePolicy" class="jd-input jd-select"><option value="skip">跳过</option><option value="review">人工审核</option></select>',
-    '          </div>',
-    '          <label class="jd-check"><input id="jdDedupeCompany" type="checkbox"> <span>同一企业只联系一个职位</span></label>',
-    '        </div>',
-    '      </div>',
-    '    </details>',
-    '    <details class="jd-group" id="jdHistoryGroup">',
-    '      <summary>历史记录（查询 / 状态 / 导出）</summary>',
-    '      <div class="jd-group-body">',
-    '        <div class="jd-filter-grid">',
-    '          <select id="jdHistoryStatus" class="jd-input jd-select"><option value="">全部状态</option><option value="sent">已发送</option><option value="failed">失败</option><option value="unknown">结果未知</option><option value="skipped">已跳过</option></select>',
-    '          <input id="jdHistoryKeyword" class="jd-input" type="text" placeholder="按职位 / 企业筛选">',
-    '          <div class="jd-actions-extra">',
-    '            <button id="jdHistoryRefresh" class="jd-btn jd-ghost" type="button">刷新</button>',
-    '            <button id="jdHistoryExport" class="jd-btn jd-ghost" type="button">导出 CSV</button>',
-    '            <button id="jdHistoryClearUnknown" class="jd-btn jd-ghost" type="button">清理未知</button>',
-    '            <button id="jdHistoryClear" class="jd-btn jd-danger" type="button">清空历史</button>',
-    '          </div>',
-    '          <div class="jd-history-list" id="jdHistoryList"></div>',
-    '        </div>',
-    '      </div>',
-    '    </details>',
-    '    <details class="jd-group" id="jdAdvancedGroup">',
-    '      <summary>高级设置（配置备份 / 未知状态）</summary>',
-    '      <div class="jd-group-body">',
+    '      <div class="jd-section">',
+    '        <div class="jd-section-title">诊断与数据管理</div>',
     '        <div class="jd-actions-extra">',
+    '          <button id="jdSelfCheck" class="jd-btn jd-ghost" type="button">结构自检</button>',
     '          <button id="jdConfigExport" class="jd-btn jd-ghost" type="button">导出配置</button>',
     '          <button id="jdConfigImport" class="jd-btn jd-ghost" type="button">导入配置</button>',
     '          <button id="jdConfigReset" class="jd-btn jd-ghost" type="button">恢复默认</button>',
     '          <button id="jdClearUnknownBoss" class="jd-btn jd-ghost" type="button">清理 BOSS 未知</button>',
     '        </div>',
+    '        <div class="jd-hint">结构自检只读探测，不点击、不输入、不发送；恢复默认不会清空历史记录</div>',
     '        <input id="jdConfigFile" type="file" accept="application/json,.json" style="display:none">',
     '      </div>',
-    '    </details>',
-    '    <div class="jd-actions">',
-    '      <button id="jdSave" class="jd-btn jd-ghost" type="button">保存配置</button>',
-    '      <button id="jdStart" class="jd-btn jd-primary" type="button">开始</button>',
-    '      <button id="jdStop" class="jd-btn jd-danger" type="button" disabled>停止</button>',
+    '      <div class="jd-actions">',
+    '        <button id="jdSave" class="jd-btn jd-ghost" type="button">保存配置</button>',
+    '        <span class="jd-hint" id="jdSaveHint"></span>',
+    '      </div>',
+    '    </section>',
+    // ===== 弹窗（始终在 DOM 中，仅切换 hidden，不销毁控件）=====
+    '    <div class="jd-modal-mask" id="jdPresetMask" hidden>',
+    '      <div class="jd-modal" role="dialog" aria-modal="true">',
+    '        <div class="jd-modal-title">管理预设话术</div>',
+    '        <div class="jd-preset-list" id="jdPresetList"></div>',
+    '        <textarea id="jdNewPreset" class="jd-textarea" rows="3" spellcheck="false" placeholder="输入新的打招呼语，点击下方“添加预设”"></textarea>',
+    '        <div class="jd-preset-actions">',
+    '          <button id="jdAddPreset" class="jd-btn jd-ghost" type="button">添加预设</button>',
+    '          <label class="jd-check"><input id="jdRandomPreset" type="checkbox"> <span>循环时随机使用</span></label>',
+    '          <button id="jdPresetClose" class="jd-btn jd-primary" type="button">关闭</button>',
+    '        </div>',
+    '      </div>',
     '    </div>',
-    '    <div class="jd-actions-extra">',
-    '      <button id="jdPause" class="jd-btn jd-ghost" type="button" disabled>暂停</button>',
-    '      <button id="jdResume" class="jd-btn jd-ghost" type="button" disabled>继续</button>',
-    '      <button id="jdSkipJob" class="jd-btn jd-ghost" type="button" disabled>跳过当前职位</button>',
-    '    </div>',
-    '    <div class="jd-status">',
-    '      <span id="jdStatus">就绪</span>',
-    '      <span id="jdProgress">0 / 0</span>',
-    '    </div>',
-    '    <div class="jd-log" id="jdLog"></div>',
-    // v1.10.33：发送前预览确认弹窗（默认关闭，开启后必须确认才发送）。
     '    <div class="jd-modal-mask" id="jdPreviewMask" hidden>',
     '      <div class="jd-modal" role="dialog" aria-modal="true">',
     '        <div class="jd-modal-title">发送前确认</div>',
@@ -7581,7 +7660,6 @@
     '        </div>',
     '      </div>',
     '    </div>',
-    // v1.10.31：预设话术编辑弹窗（默认隐藏，点条目「编辑」打开）。
     '    <div class="jd-modal-mask" id="jdEditMask" hidden>',
     '      <div class="jd-modal" role="dialog" aria-modal="true">',
     '        <div class="jd-modal-title">编辑预设话术</div>',
@@ -7592,7 +7670,25 @@
     '        </div>',
     '      </div>',
     '    </div>',
-    '  </div>',
+    '  </main>',
+    // ===== 日志条：默认折叠，只显示最近一条 =====
+    '  <section class="jd-logbar">',
+    '    <button class="jd-logtoggle" id="jdLogToggle" type="button" aria-expanded="false" aria-controls="jdLog">',
+    '      <span class="latest" id="jdLogLatest">运行日志</span><span id="jdLogArrow">▸</span></button>',
+    '    <div class="jd-log" id="jdLog" hidden></div>',
+    '  </section>',
+    // ===== 固定任务操作栏 =====
+    '  <footer class="jd-taskbar">',
+    '    <div class="jd-taskbar-info"><b id="jdTaskbarStatus">就绪</b><span id="jdTaskbarProgress">0 / 0</span></div>',
+    '    <span class="jd-taskbar-hint" id="jdTaskbarHint" hidden></span>',
+    '    <div class="jd-taskbar-actions">',
+    '      <button id="jdSkipJob" class="jd-btn jd-ghost" type="button" style="display:none">跳过</button>',
+    '      <button id="jdPause" class="jd-btn jd-ghost" type="button" style="display:none">暂停</button>',
+    '      <button id="jdResume" class="jd-btn jd-ghost" type="button" style="display:none">继续</button>',
+    '      <button id="jdStart" class="jd-btn jd-primary" type="button">开始任务</button>',
+    '      <button id="jdStop" class="jd-btn jd-danger" type="button" style="display:none">停止</button>',
+    '    </div>',
+    '  </footer>',
     '</div>'
   ].join('');
 
@@ -7608,10 +7704,16 @@
       ui.logEl.removeChild(ui.logEl.firstChild);
     }
     ui.logEl.scrollTop = ui.logEl.scrollHeight;
+    // v1.10.34：日志条默认折叠，仅显示最近一条的摘要。
+    if (ui.logLatest) {
+      ui.logLatest.textContent = line.textContent;
+      ui.logLatest.className = 'latest' + (type ? ' ' + type : '');
+    }
   }
 
   function setStatus(text) {
     if (ui && ui.status) ui.status.textContent = text;
+    if (ui) refreshTaskSummary();
   }
 
   function updateProgress() {
@@ -7628,6 +7730,134 @@
       text += ' · 今日剩余 ' + (remaining === Infinity ? '不限' : remaining);
     }
     ui.progress.textContent = text;
+    refreshTaskSummary();
+  }
+
+  // =========================================================================
+  // v1.10.34：四 Tab 切换、首页摘要与底部任务栏（纯 UI 层，不触碰业务流程）
+  // =========================================================================
+  function switchTab(name) {
+    if (!ui || !ui.panels) return;
+    const names = ['task', 'filter', 'history', 'settings'];
+    const target = names.indexOf(name) !== -1 ? name : 'task';
+    ui.activeTab = target;
+    (ui.tabButtons || []).forEach(function (btn) {
+      const active = btn.getAttribute('data-tab') === target;
+      btn.classList.toggle('active', active);
+      btn.setAttribute('aria-selected', active ? 'true' : 'false');
+      btn.tabIndex = active ? 0 : -1;
+    });
+    ui.panels.forEach(function (panel) {
+      panel.hidden = panel.id !== 'jdTab' + target.charAt(0).toUpperCase() + target.slice(1);
+    });
+    if (target === 'history') renderHistoryList();
+    refreshTaskSummary();
+  }
+
+  // 首页/标题栏/任务栏/筛选摘要的统一刷新；只读取现有状态与配置。
+  function refreshTaskSummary() {
+    if (!ui) return;
+    const config = loadConfig();
+    const target = state.target || 0;
+    const sent = state.sent || 0;
+    const skipped = state.skipped || 0;
+    const failed = taskState.failed || 0;
+    const unknown = taskState.unknown || 0;
+    const setText = function (el, text) {
+      if (el) el.textContent = text;
+    };
+    setText(ui.statSent, sent);
+    setText(ui.statSkipped, skipped);
+    setText(ui.statFailed, failed);
+    setText(ui.statUnknown, unknown);
+    if (ui.progressBar) {
+      ui.progressBar.style.width =
+        (target > 0 ? Math.min(100, Math.round(sent / target * 100)) : 0) + '%';
+    }
+    const preset = uiPresets[uiSelectedPreset] || '';
+    setText(ui.presetPreview, preset ? truncate(preset, 64) : '未设置话术');
+    setText(ui.presetModeHint, ui.randomPreset && ui.randomPreset.checked
+      ? '随机模式：每轮从预设中随机选择'
+      : '固定模式：使用当前选中的话术');
+    setText(ui.intervalSummary, '当前间隔 ' + (config.minInterval || 0) + '–' +
+      (config.maxInterval || 0) + ' 秒 · 在「设置」中调整');
+    let runMode = '正式运行';
+    if (config.dryRun) runMode = '试运行：只扫描展示，不点击沟通、不发送';
+    else if (config.previewConfirm) runMode = '正式运行 · 发送前需要人工确认';
+    if (config.enableGreeting === false) runMode += ' · 自动打招呼已关闭';
+    setText(ui.runModeHint, '当前：' + runMode);
+    if (config.dailyLimit > 0) {
+      const stats = readDaily(config);
+      setText(ui.quotaSummary, '今日已发送 ' + stats.sent + ' / ' + config.dailyLimit +
+        '，剩余 ' + dailyRemaining(config));
+    } else {
+      setText(ui.quotaSummary, '每日额度：不限');
+    }
+    if (ui.filterSummary) {
+      const parts = [];
+      const include = splitList(config.includeKeywords).length;
+      const exclude = splitList(config.excludeKeywords).length;
+      const white = splitList(config.companyWhitelist).length;
+      const black = splitList(config.companyBlacklist).length;
+      const locations = splitList(config.locationFilter).length;
+      if (include) parts.push('包含 ' + include + ' 项');
+      if (exclude) parts.push('排除 ' + exclude + ' 项');
+      if (white) parts.push('白名单 ' + white);
+      if (black) parts.push('黑名单 ' + black);
+      if (locations) parts.push('地点 ' + locations + ' 项');
+      if (config.minSalary > 0 || config.maxSalary > 0) {
+        parts.push('薪资 ' + (config.minSalary || 0) + '–' + (config.maxSalary || '不限'));
+      }
+      if (config.minScore > 0) parts.push('评分 ≥' + config.minScore);
+      if (config.dedupeByCompany) parts.push('企业去重');
+      ui.filterSummary.textContent = parts.length
+        ? '筛选：' + parts.join(' · ')
+        : '筛选：全部放行（未设置任何条件）';
+    }
+    const statusText = ui.status ? ui.status.textContent : '就绪';
+    setText(ui.headStatus, statusText);
+    setText(ui.headProgress, sent + ' / ' + target);
+    let taskStatus = '就绪';
+    if (state.running) {
+      if (state.stopRequested) taskStatus = '正在停止';
+      else if (taskState.paused) taskStatus = '已暂停';
+      else taskStatus = '运行中';
+    }
+    setText(ui.taskbarStatus, taskStatus);
+    setText(ui.taskbarProgress, sent + ' / ' + target +
+      (skipped ? ' · 跳过 ' + skipped : '') +
+      (failed ? ' · 失败 ' + failed : '') +
+      (unknown ? ' · 未知 ' + unknown : ''));
+    if (ui.taskbarHint) {
+      if (!state.running && unknown > 0) {
+        ui.taskbarHint.textContent = '有 ' + unknown + ' 条结果未知，请到「记录」核实';
+        ui.taskbarHint.hidden = false;
+      } else {
+        ui.taskbarHint.hidden = true;
+      }
+    }
+    syncTaskbar();
+  }
+
+  // 底部任务栏按状态只显示可执行的操作，避免同时出现开始/暂停/继续/停止。
+  function syncTaskbar() {
+    if (!ui) return;
+    const running = !!state.running;
+    const stopping = running && !!state.stopRequested;
+    const paused = running && !!taskState.paused;
+    const show = function (el, visible) {
+      if (el) el.style.display = visible ? '' : 'none';
+    };
+    show(ui.start, !running);
+    show(ui.pause, running && !paused);
+    show(ui.resume, running && paused);
+    show(ui.skip, running && !stopping);
+    show(ui.stop, running);
+    if (ui.start) ui.start.disabled = running;
+    if (ui.pause) ui.pause.disabled = !running || paused || stopping;
+    if (ui.resume) ui.resume.disabled = !running || !paused || stopping;
+    if (ui.skip) ui.skip.disabled = !running;
+    if (ui.stop) ui.stop.disabled = !running || stopping;
   }
 
   // v1.10.33：暂停/继续/跳过按钮的可用态（发送中不允许跳过，避免中断消息）。
@@ -7636,36 +7866,79 @@
     if (ui.pause) ui.pause.disabled = !state.running || taskState.paused;
     if (ui.resume) ui.resume.disabled = !state.running || !taskState.paused;
     if (ui.skip) ui.skip.disabled = !state.running;
+    // v1.10.34：同步任务栏按钮显隐。
+    syncTaskbar();
   }
 
-  // v1.10.33：历史记录列表（最近 20 条，支持状态/关键词过滤）。
+  // v1.10.34：历史记录列表——顶部真实统计、状态徽标、点击展开详情。
   function renderHistoryList() {
     if (!ui || !ui.historyList) return;
+    const all = readHistory();
+    const statusLabels = {
+      sent: '已发送', failed: '失败', unknown: '结果未知', skipped: '已跳过', review: '待审核'
+    };
+    const countOf = function (status) {
+      return all.filter(function (item) { return item.status === status; }).length;
+    };
+    if (ui.historyStatSent) ui.historyStatSent.textContent = countOf('sent');
+    if (ui.historyStatFailed) ui.historyStatFailed.textContent = countOf('failed');
+    if (ui.historyStatUnknown) ui.historyStatUnknown.textContent = countOf('unknown');
+    if (ui.historyStatSkipped) ui.historyStatSkipped.textContent = countOf('skipped');
     const status = ui.historyStatus ? ui.historyStatus.value : '';
     const keyword = norm(ui.historyKeyword ? ui.historyKeyword.value : '');
-    const list = readHistory().filter(function (item) {
+    const list = all.filter(function (item) {
       if (status && item.status !== status) return false;
       if (keyword && (norm(item.jobTitle) + norm(item.companyName)).indexOf(keyword) === -1) return false;
       return true;
     });
     ui.historyList.innerHTML = '';
-    const recent = list.slice(-20).reverse();
+    const recent = list.slice(-30).reverse();
     if (!recent.length) {
       const empty = document.createElement('div');
-      empty.className = 'row';
+      empty.className = 'jd-history-empty';
       empty.textContent = '暂无记录';
       ui.historyList.appendChild(empty);
       return;
     }
+    const formatTime = function (value) {
+      if (!value) return '—';
+      try {
+        return new Date(value).toLocaleString('zh-CN', { hour12: false });
+      } catch (err) {
+        return '—';
+      }
+    };
     recent.forEach(function (item) {
       const row = document.createElement('div');
-      row.className = 'row';
-      const time = new Date(item.updatedAt || item.createdAt || Date.now())
-        .toLocaleTimeString('zh-CN', { hour12: false });
-      row.textContent = '[' + time + '] ' + (item.status || '') + ' · ' +
-        truncate(item.jobTitle || '未命名职位', 16) +
-        (item.companyName ? ' · ' + truncate(item.companyName, 10) : '') +
-        (item.errorCode ? ' · ' + item.errorCode : '');
+      row.className = 'jd-history-row';
+      const head = document.createElement('div');
+      head.className = 'head';
+      const title = document.createElement('span');
+      title.className = 'title';
+      title.textContent = (item.jobTitle || '未命名职位') +
+        (item.companyName ? ' · ' + item.companyName : '');
+      const badge = document.createElement('span');
+      badge.className = 'jd-badge ' + (item.status || '');
+      badge.textContent = statusLabels[item.status] || item.status || '—';
+      head.appendChild(title);
+      head.appendChild(badge);
+      const meta = document.createElement('div');
+      meta.className = 'meta';
+      meta.textContent = '平台：' + (item.platform || '—') +
+        '\n地点：' + (item.location || '—') + ' · 薪资：' + (item.salary || '—') +
+        '\n话术：' + (item.greeting ? truncate(item.greeting, 60) : '—') +
+        '\n时间：' + formatTime(item.updatedAt || item.createdAt) +
+        (item.confirmedAt ? '\n确认：' + formatTime(item.confirmedAt) : '') +
+        (item.errorCode || item.errorMessage
+          ? '\n错误：' + (item.errorCode || '—') +
+            (item.errorMessage ? ' ' + item.errorMessage : '')
+          : '');
+      // 点击展开/收起详情；字段缺失显示短横线，不虚构内容。
+      row.addEventListener('click', function () {
+        row.classList.toggle('open');
+      });
+      row.appendChild(head);
+      row.appendChild(meta);
       ui.historyList.appendChild(row);
     });
   }
@@ -7841,7 +8114,39 @@
       progress: get('jdProgress'),
       logEl: get('jdLog'),
       platform: get('jdPlatform'),
-      collapse: get('jdCollapse')
+      collapse: get('jdCollapse'),
+      // ===== v1.10.34：四 Tab 信息架构与固定任务栏 =====
+      activeTab: 'task',
+      tabButtons: Array.prototype.slice.call(shadow.querySelectorAll('.jd-tab')),
+      panels: Array.prototype.slice.call(shadow.querySelectorAll('.jd-tabpanel')),
+      statSent: get('jdStatSent'),
+      statSkipped: get('jdStatSkipped'),
+      statFailed: get('jdStatFailed'),
+      statUnknown: get('jdStatUnknown'),
+      progressBar: get('jdProgressBar'),
+      presetPreview: get('jdPresetPreview'),
+      presetModeHint: get('jdPresetModeHint'),
+      managePresets: get('jdManagePresets'),
+      presetMask: get('jdPresetMask'),
+      presetClose: get('jdPresetClose'),
+      intervalSummary: get('jdIntervalSummary'),
+      quotaSummary: get('jdQuotaSummary'),
+      runModeHint: get('jdRunModeHint'),
+      filterSummary: get('jdFilterSummary'),
+      historyStatSent: get('jdHistoryStatSent'),
+      historyStatFailed: get('jdHistoryStatFailed'),
+      historyStatUnknown: get('jdHistoryStatUnknown'),
+      historyStatSkipped: get('jdHistoryStatSkipped'),
+      headStatus: get('jdHeadStatus'),
+      headProgress: get('jdHeadProgress'),
+      taskbarStatus: get('jdTaskbarStatus'),
+      taskbarProgress: get('jdTaskbarProgress'),
+      taskbarHint: get('jdTaskbarHint'),
+      saveHint: get('jdSaveHint'),
+      logToggle: get('jdLogToggle'),
+      logDrawer: get('jdLog'),
+      logLatest: get('jdLogLatest'),
+      logArrow: get('jdLogArrow')
     };
 
     if (ui.platform) ui.platform.textContent = platform.name;
@@ -7858,6 +8163,56 @@
     writeConfigToUI(loadConfig());
     updateProgress();
     setStatus('就绪');
+    // v1.10.34：默认打开任务 Tab；Tab 只切换显示，不销毁任何控件。
+    switchTab('task');
+
+    (ui.tabButtons || []).forEach(function (btn) {
+      btn.addEventListener('click', function () {
+        switchTab(btn.getAttribute('data-tab'));
+      });
+      btn.addEventListener('keydown', function (event) {
+        if (event.key !== 'ArrowRight' && event.key !== 'ArrowLeft') return;
+        event.preventDefault();
+        const names = ['task', 'filter', 'history', 'settings'];
+        const index = names.indexOf(ui.activeTab);
+        const next = event.key === 'ArrowRight'
+          ? (index + 1) % names.length
+          : (index - 1 + names.length) % names.length;
+        switchTab(names[next]);
+        const targetBtn = (ui.tabButtons || []).filter(function (item) {
+          return item.getAttribute('data-tab') === names[next];
+        })[0];
+        if (targetBtn) targetBtn.focus();
+      });
+    });
+
+    // 日志条：默认折叠，只显示最近一条；展开后独立滚动。
+    if (ui.logToggle && ui.logDrawer) {
+      ui.logToggle.addEventListener('click', function () {
+        const willOpen = ui.logDrawer.hidden;
+        ui.logDrawer.hidden = !willOpen;
+        ui.logToggle.setAttribute('aria-expanded', willOpen ? 'true' : 'false');
+        if (ui.logArrow) ui.logArrow.textContent = willOpen ? '▾' : '▸';
+        if (willOpen) ui.logDrawer.scrollTop = ui.logDrawer.scrollHeight;
+      });
+    }
+
+    // 预设管理抽屉：首页只保留下拉与预览，完整列表放入弹窗。
+    function openPresetManager() {
+      if (!ui.presetMask) return;
+      renderPresets();
+      ui.presetMask.hidden = false;
+    }
+    function closePresetManager() {
+      if (ui.presetMask) ui.presetMask.hidden = true;
+    }
+    if (ui.managePresets) ui.managePresets.addEventListener('click', openPresetManager);
+    if (ui.presetClose) ui.presetClose.addEventListener('click', closePresetManager);
+    if (ui.presetMask) {
+      ui.presetMask.addEventListener('click', function (event) {
+        if (event.target === ui.presetMask) closePresetManager();
+      });
+    }
 
     if (ui.addPreset) {
       ui.addPreset.addEventListener('click', function () {
@@ -7894,6 +8249,12 @@
     // v1.10.32：启动结构自检按钮（纯只读探测，运行中也可执行）。
     if (ui.selfCheck) {
       ui.selfCheck.addEventListener('click', function () {
+        // v1.10.34：自检结果输出到日志抽屉，点击时自动展开便于查看。
+        if (ui.logDrawer) {
+          ui.logDrawer.hidden = false;
+          if (ui.logToggle) ui.logToggle.setAttribute('aria-expanded', 'true');
+          if (ui.logArrow) ui.logArrow.textContent = '▾';
+        }
         runStructureSelfCheck();
       });
     }
@@ -7907,17 +8268,23 @@
     if (ui.historyExport) ui.historyExport.addEventListener('click', exportHistoryCsv);
     if (ui.historyClearUnknown) {
       ui.historyClearUnknown.addEventListener('click', function () {
+        // v1.10.34：解除未知状态保护属于危险操作，需二次确认。
+        if (!window.confirm('清理「结果未知」记录会解除这些职位的保护状态，之后可能允许重新处理。确定继续？')) return;
         const count = clearUnknownHistory() + clearUnknownBossJobs();
         log(count ? '已清理 ' + count + ' 条“结果未知”记录，可重新处理'
           : '没有需要清理的未知记录', 'ok');
         renderHistoryList();
+        refreshTaskSummary();
       });
     }
     if (ui.historyClear) {
       ui.historyClear.addEventListener('click', function () {
+        // v1.10.34：清空历史只删除本地历史列表，不联动删除 BOSS 已确认状态。
+        if (!window.confirm('清空历史会删除本地全部历史记录（不会删除 BOSS 已确认发送状态）。确定继续？')) return;
         writeHistory([]);
         log('历史记录已清空', 'warn');
         renderHistoryList();
+        refreshTaskSummary();
       });
     }
     if (ui.configExport) ui.configExport.addEventListener('click', exportConfigJson);
@@ -7948,6 +8315,41 @@
         renderHistoryList();
       });
     }
+    // v1.10.34：安全开关与额度即时保存，避免切 Tab 丢失输入。
+    function persistUiChange() {
+      const config = readAndValidateConfig();
+      persistConfig(config);
+      refreshTaskSummary();
+    }
+    if (ui.dryRun) {
+      ui.dryRun.addEventListener('change', function () {
+        persistUiChange();
+        log(ui.dryRun.checked
+          ? '已开启试运行：只扫描展示，不点击沟通、不发送任何消息'
+          : '已关闭试运行：将按正式模式运行', ui.dryRun.checked ? 'warn' : 'ok');
+      });
+    }
+    if (ui.previewConfirm) {
+      ui.previewConfirm.addEventListener('change', function () {
+        persistUiChange();
+        log(ui.previewConfirm.checked
+          ? '已开启发送前预览：每次开始前需人工确认'
+          : '已关闭发送前预览：点击开始后直接执行', ui.previewConfirm.checked ? 'ok' : 'warn');
+      });
+    }
+    if (ui.dailyLimit) {
+      ui.dailyLimit.addEventListener('change', function () {
+        persistUiChange();
+        log('每日发送上限已保存：' + (parseInt(ui.dailyLimit.value, 10) || 0) + '（0=不限）', 'ok');
+      });
+    }
+    if (ui.quotaTimezone) {
+      ui.quotaTimezone.addEventListener('change', function () {
+        persistUiChange();
+        log('额度统计时区已保存：' + (ui.quotaTimezone.value.trim() || '本机时区'), 'ok');
+      });
+    }
+
     renderHistoryList();
     syncTaskButtons();
     if (ui.presetSelect) {
@@ -8084,8 +8486,17 @@
         const config = readAndValidateConfig();
         writeConfigToUI(config);
         persistConfig(config);
+        // v1.10.34：持久化后按最新配置刷新摘要（writeConfigToUI 内部读取的是旧存储）。
+        refreshTaskSummary();
         log('配置已保存', 'ok');
         setStatus('配置已保存');
+        // v1.10.34：轻量保存状态提示（仅 UI，不影响配置语义）。
+        if (ui.saveHint) {
+          ui.saveHint.textContent = '已保存';
+          setTimeout(function () {
+            if (ui.saveHint && ui.saveHint.textContent === '已保存') ui.saveHint.textContent = '';
+          }, 1600);
+        }
         setTimeout(function () {
           if (!state.running) setStatus('就绪');
         }, 1800);
@@ -8119,6 +8530,8 @@
         const collapsed = ui.wrap.classList.toggle('collapsed');
         ui.collapse.textContent = collapsed ? '+' : '−';
         ui.collapse.title = collapsed ? '展开面板' : '收起面板';
+        // v1.10.34：收起态仍显示平台、状态与进度摘要。
+        refreshTaskSummary();
       });
     }
 
